@@ -26,11 +26,13 @@ import yaml
 from packaging import version as pkg_version
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 
-from ._init_options import is_ai_skills_enabled
-from ._invocation_style import is_slash_skills_agent
-from ._utils import dump_frontmatter
-from .catalogs import CatalogEntry as BaseCatalogEntry
-from .catalogs import CatalogStackBase
+from .._assets import _locate_core_pack, _repo_root
+from .._init_options import is_ai_skills_enabled
+from .._invocation_style import is_dollar_skills_agent, is_slash_skills_agent
+from .._utils import dump_frontmatter, relative_extension_path_violation, version_satisfies
+from ..catalogs import CatalogEntry as BaseCatalogEntry
+from ..catalogs import CatalogStackBase
+from ..shared_infra import verify_archive_sha256
 
 _FALLBACK_CORE_COMMAND_NAMES = frozenset(
     {
@@ -61,14 +63,28 @@ def _load_core_command_names() -> frozenset[str]:
     Prefer the wheel-time ``core_pack`` bundle when present, and fall back to
     the source checkout when running from the repository. If neither is
     available, use the baked-in fallback set so validation still works.
+
+    Path resolution is delegated to the canonical ``_assets`` resolvers
+    (``_locate_core_pack`` / ``_repo_root``) — the same ones the presets and
+    bundle loaders use — rather than bespoke ``Path(__file__)`` arithmetic.
+    Hand-counted ``.parent`` chains silently broke discovery once already: the
+    #3014 move of this module from ``specify_cli/extensions.py`` to
+    ``specify_cli/extensions/__init__.py`` pushed the file one directory deeper
+    without updating the counts, so both candidates resolved to non-existent
+    paths and every call fell through to the fallback (#3274). The shared
+    resolvers are anchored to the package root, so discovery survives future
+    module moves.
     """
+    core_pack = _locate_core_pack()
     candidate_dirs = [
-        Path(__file__).parent / "core_pack" / "commands",
-        Path(__file__).resolve().parent.parent.parent / "templates" / "commands",
+        # Wheel install: force-include maps templates/commands → core_pack/commands.
+        core_pack / "commands" if core_pack is not None else None,
+        # Source checkout / editable install: repo-root templates/commands.
+        _repo_root() / "templates" / "commands",
     ]
 
     for commands_dir in candidate_dirs:
-        if not commands_dir.is_dir():
+        if commands_dir is None or not commands_dir.is_dir():
             continue
 
         command_names = {
@@ -289,6 +305,18 @@ class ExtensionManifest:
                 )
             if "name" not in cmd or "file" not in cmd:
                 raise ValidationError("Command missing 'name' or 'file'")
+
+            # Validate the 'file' field at manifest-load time using the single
+            # shared policy in relative_extension_path_violation(), so manifest
+            # validation cannot drift from the runtime registrar guard. This is
+            # defense-in-depth: the command/skill/preset readers also contain
+            # the resolved path, but rejecting an unsafe value here surfaces a
+            # clear error instead of silently skipping the command.
+            cmd_file = cmd["file"]
+            reason = relative_extension_path_violation(cmd_file)
+            if reason:
+                label = repr(cmd_file) if isinstance(cmd_file, str) else f"for command '{cmd.get('name')}'"
+                raise ValidationError(f"Invalid command 'file' {label}: {reason}")
 
             # Validate command name format
             if not EXTENSION_COMMAND_NAME_PATTERN.match(cmd["name"]):
@@ -893,7 +921,7 @@ class ExtensionManager:
         be created due to symlink, containment, or permission issues so
         that callers can fall back gracefully.
         """
-        from . import (
+        from .. import (
             _print_cli_warning,
             load_init_options,
             resolve_active_skills_dir,
@@ -936,7 +964,7 @@ class ExtensionManager:
         if not isinstance(selected_ai, str) or not selected_ai:
             return _ensure_usable(skills_dir)
 
-        from .agents import CommandRegistrar
+        from ..agents import CommandRegistrar
 
         registrar = CommandRegistrar()
         agent_config = registrar.AGENT_CONFIGS.get(selected_ai)
@@ -973,9 +1001,9 @@ class ExtensionManager:
         if not skills_dir:
             return []
 
-        from . import load_init_options
-        from .agents import CommandRegistrar
-        from .integrations import get_integration
+        from .. import load_init_options
+        from ..agents import CommandRegistrar
+        from ..integrations import get_integration
 
         written: List[str] = []
         opts = load_init_options(self.project_root)
@@ -985,6 +1013,7 @@ class ExtensionManager:
         if not isinstance(selected_ai, str) or not selected_ai:
             return []
         registrar = CommandRegistrar()
+        agent_config = registrar.AGENT_CONFIGS.get(selected_ai, {})
         integration = get_integration(selected_ai)
 
         for cmd_info in manifest.commands:
@@ -1018,15 +1047,16 @@ class ExtensionManager:
             skill_file = skill_subdir / "SKILL.md"
             cache_root = extension_dir / ".specify-dev" / "extension-skills"
             cache_file = cache_root / skill_name / "SKILL.md"
+            use_dev_symlink = link_outputs and not agent_config.get("dev_no_symlink")
             CommandRegistrar._ensure_inside(cache_file, cache_root)
             if skill_file.exists() or skill_file.is_symlink():
+                is_expected_dev_symlink = self._is_expected_dev_symlink(
+                    skill_file, cache_file
+                )
                 # Do not overwrite user-customized skills, but allow dev-mode
                 # symlinks that point back to this extension's generated cache
                 # to be refreshed on a subsequent dev install.
-                if not (
-                    link_outputs
-                    and self._is_expected_dev_symlink(skill_file, cache_file)
-                ):
+                if not is_expected_dev_symlink:
                     continue
 
             # Create skill directory; track whether we created it so we can clean
@@ -1061,20 +1091,10 @@ class ExtensionManager:
             )
             # Preserve the command's argument-hint in the generated skill,
             # mirroring the core template path (ClaudeIntegration.setup injects
-            # it for built-in commands). The value is added to the frontmatter
-            # dict before serialization — rather than via the string-based
-            # inject_argument_hint helper — so that a folded multi-line
-            # description cannot be split by the inserted line. Gated on the
-            # integration exposing inject_argument_hint so only argument-hint
-            # aware agents receive the key, leaving build_skill_frontmatter's
-            # shared shape unchanged for every other agent.
-            argument_hint = frontmatter.get("argument-hint")
-            if (
-                argument_hint
-                and integration is not None
-                and hasattr(integration, "inject_argument_hint")
-            ):
-                frontmatter_data["argument-hint"] = str(argument_hint)
+            # it for built-in commands). See CommandRegistrar.apply_argument_hint
+            # for why the value is added to the dict before serialization rather
+            # than via the string-based inject_argument_hint helper.
+            registrar.apply_argument_hint(frontmatter, frontmatter_data, integration)
             frontmatter_text = dump_frontmatter(frontmatter_data)
 
             # Derive a human-friendly title from the command name
@@ -1091,7 +1111,7 @@ class ExtensionManager:
             ):
                 skill_content = integration.post_process_skill_content(skill_content)
 
-            if link_outputs:
+            if use_dev_symlink:
                 try:
                     cache_file.parent.mkdir(parents=True, exist_ok=True)
                     cache_file.write_text(skill_content, encoding="utf-8")
@@ -1104,6 +1124,8 @@ class ExtensionManager:
                         skill_file.unlink()
                     skill_file.write_text(skill_content, encoding="utf-8")
             else:
+                if skill_file.is_symlink():
+                    skill_file.unlink()
                 skill_file.write_text(skill_content, encoding="utf-8")
             written.append(skill_name)
 
@@ -1199,7 +1221,7 @@ class ExtensionManager:
                 shutil.rmtree(skill_subdir)
         else:
             # Fallback: scan all possible agent skills directories
-            from . import AGENT_CONFIG, DEFAULT_SKILLS_DIR
+            from .. import AGENT_CONFIG, DEFAULT_SKILLS_DIR
 
             candidate_dirs: set[Path] = set()
             for cfg in AGENT_CONFIG.values():
@@ -1272,19 +1294,19 @@ class ExtensionManager:
             CompatibilityError: If extension is incompatible
         """
         required = manifest.requires_speckit_version
-        current = pkg_version.Version(speckit_version)
 
         # Parse version specifier (e.g., ">=0.1.0,<2.0.0")
         try:
-            specifier = SpecifierSet(required)
-            if current not in specifier:
-                raise CompatibilityError(
-                    f"Extension requires spec-kit {required}, "
-                    f"but {speckit_version} is installed.\n"
-                    f"Upgrade spec-kit with: {REINSTALL_COMMAND}"
-                )
+            SpecifierSet(required)  # Just to validate
         except InvalidSpecifier:
             raise CompatibilityError(f"Invalid version specifier: {required}")
+
+        if not version_satisfies(speckit_version, required):
+            raise CompatibilityError(
+                f"Extension requires spec-kit {required}, "
+                f"but {speckit_version} is installed.\n"
+                f"Upgrade spec-kit with: {REINSTALL_COMMAND}"
+            )
 
         return True
 
@@ -1614,7 +1636,7 @@ class ExtensionManager:
         # Resolve the skills directory for the specific agent so cleanup is
         # agent-scoped and does not depend on the currently-active agent in
         # init-options.  Use the same helper that extension install uses.
-        from . import _get_skills_dir as resolve_skills_dir
+        from .. import _get_skills_dir as resolve_skills_dir
 
         agent_skills_dir = resolve_skills_dir(self.project_root, agent_name)
 
@@ -1676,21 +1698,17 @@ class ExtensionManager:
     def register_enabled_extensions_for_agent(self, agent_name: str) -> None:
         """Register installed, enabled extensions for ``agent_name``.
 
-        This is intended to be called after switching integrations. Command
-        registration is scoped to the explicit ``agent_name`` argument, but some
-        behavior still depends on the current init-options state (for example,
-        skills-mode handling uses the active ``ai`` / ``ai_skills`` settings).
-
-        Callers should therefore pass the agent that has just been made active
-        in init-options; in normal use, ``agent_name`` is expected to match the
-        current ``ai`` value. This mirrors extension install behavior while
-        avoiding stale default-mode command directories when that active agent
-        is running in skills mode (notably Copilot ``--skills``).
+        Command-file registration is scoped to the explicit ``agent_name``
+        argument, so this method can be used after install, upgrade, or switch.
+        Extension skill rendering is still scoped to the active ``ai`` /
+        ``ai_skills`` settings in init-options, so non-active skills-mode
+        targets receive command files here. Per-agent skills parity is tracked
+        separately in #2948.
         """
         if not agent_name:
             return
 
-        from . import load_init_options
+        from .. import load_init_options
 
         registrar = CommandRegistrar()
         agent_config = registrar.AGENT_CONFIGS.get(agent_name)
@@ -1742,38 +1760,53 @@ class ExtensionManager:
                     if new_registered != registered_commands:
                         updates["registered_commands"] = new_registered
 
-                try:
-                    registered_skills = self._register_extension_skills(manifest, ext_dir)
-                except Exception as skills_err:
-                    # Skills are a companion artifact.  If command registration
-                    # already succeeded, still persist it so later cleanup can
-                    # find those command files.
-                    from . import _print_cli_warning
-
-                    _print_cli_warning(
-                        "register extension skills for",
-                        "extension",
-                        ext_id,
-                        skills_err,
-                        continuing=(
-                            "Continuing with available registration results for this "
-                            "extension and the remaining extensions."
-                        ),
-                    )
-                else:
-                    if registered_skills:
-                        existing_skills = self._valid_name_list(
-                            metadata.get("registered_skills", [])
+                # Extension *skills* are only ever rendered for the active agent:
+                # `_register_extension_skills` resolves the skills dir and
+                # frontmatter from init-options["ai"], ignoring ``agent_name``.
+                # When this method runs for a non-active agent — as install/upgrade
+                # now do for a secondary integration (#2886) — the skills pass would
+                # re-render the *active* agent's extension skills as a side effect,
+                # resurrecting skill files the user deliberately deleted. Skip it
+                # unless the target is the active agent; `switch` is unaffected
+                # because it activates the target before registering. (Rendering
+                # skills for a non-active target is tracked separately in #2948.)
+                if agent_name == active_agent:
+                    try:
+                        registered_skills = self._register_extension_skills(
+                            manifest, ext_dir
                         )
-                        merged_skills = list(dict.fromkeys(existing_skills + registered_skills))
-                        updates["registered_skills"] = merged_skills
+                    except Exception as skills_err:
+                        # Skills are a companion artifact.  If command registration
+                        # already succeeded, still persist it so later cleanup can
+                        # find those command files.
+                        from .. import _print_cli_warning
+
+                        _print_cli_warning(
+                            "register extension skills for",
+                            "extension",
+                            ext_id,
+                            skills_err,
+                            continuing=(
+                                "Continuing with available registration results for this "
+                                "extension and the remaining extensions."
+                            ),
+                        )
+                    else:
+                        if registered_skills:
+                            existing_skills = self._valid_name_list(
+                                metadata.get("registered_skills", [])
+                            )
+                            merged_skills = list(
+                                dict.fromkeys(existing_skills + registered_skills)
+                            )
+                            updates["registered_skills"] = merged_skills
 
                 if updates:
                     self.registry.update(ext_id, updates)
             except Exception as ext_err:
                 # Best-effort per extension: warn and move on so a single bad
                 # extension cannot silently drop the others. See #2950.
-                from . import _print_cli_warning
+                from .. import _print_cli_warning
 
                 _print_cli_warning(
                     "register extension artifacts for",
@@ -1853,24 +1886,6 @@ class ExtensionManager:
             return None
 
 
-def version_satisfies(current: str, required: str) -> bool:
-    """Check if current version satisfies required version specifier.
-
-    Args:
-        current: Current version (e.g., "0.1.5")
-        required: Required version specifier (e.g., ">=0.1.0,<2.0.0")
-
-    Returns:
-        True if version satisfies requirement
-    """
-    try:
-        current_ver = pkg_version.Version(current)
-        specifier = SpecifierSet(required)
-        return current_ver in specifier
-    except (pkg_version.InvalidVersion, InvalidSpecifier):
-        return False
-
-
 class CommandRegistrar:
     """Handles registration of extension commands with AI agents.
 
@@ -1880,31 +1895,31 @@ class CommandRegistrar:
     """
 
     # Re-export AGENT_CONFIGS at class level for direct attribute access
-    from .agents import CommandRegistrar as _AgentRegistrar
+    from ..agents import CommandRegistrar as _AgentRegistrar
 
     AGENT_CONFIGS = _AgentRegistrar.AGENT_CONFIGS
 
     def __init__(self):
-        from .agents import CommandRegistrar as _Registrar
+        from ..agents import CommandRegistrar as _Registrar
 
         self._registrar = _Registrar()
 
     # Delegate static/utility methods
     @staticmethod
     def parse_frontmatter(content: str) -> tuple[dict, str]:
-        from .agents import CommandRegistrar as _Registrar
+        from ..agents import CommandRegistrar as _Registrar
 
         return _Registrar.parse_frontmatter(content)
 
     @staticmethod
     def render_frontmatter(fm: dict) -> str:
-        from .agents import CommandRegistrar as _Registrar
+        from ..agents import CommandRegistrar as _Registrar
 
         return _Registrar.render_frontmatter(fm)
 
     @staticmethod
     def _write_copilot_prompt(project_root, cmd_name: str) -> None:
-        from .agents import CommandRegistrar as _Registrar
+        from ..agents import CommandRegistrar as _Registrar
 
         _Registrar.write_copilot_prompt(project_root, cmd_name)
 
@@ -2039,12 +2054,18 @@ class ExtensionCatalog(CatalogStackBase):
     ) -> Optional[str]:
         """Resolve a GitHub release asset URL to its API asset URL.
 
-        Delegates to the shared helper in :mod:`specify_cli._github_http`.
+        Delegates to the shared helper in :mod:`specify_cli._github_http`,
+        passing the ``github`` provider hosts from ``auth.json`` so GitHub
+        Enterprise Server release assets resolve via ``/api/v3``.
         """
         from specify_cli._github_http import resolve_github_release_asset_api_url
+        from specify_cli.authentication.http import github_provider_hosts
 
         return resolve_github_release_asset_api_url(
-            download_url, self._open_url, timeout=timeout
+            download_url,
+            self._open_url,
+            timeout=timeout,
+            github_hosts=github_provider_hosts(),
         )
 
     def _validate_catalog_payload(self, catalog_data: Any, url: str) -> None:
@@ -2604,6 +2625,10 @@ class ExtensionCatalog(CatalogStackBase):
             ) as response:
                 zip_data = response.read()
 
+            verify_archive_sha256(
+                zip_data, ext_info.get("sha256"), extension_id, ExtensionError
+            )
+
             zip_path.write_bytes(zip_data)
             return zip_path
 
@@ -2855,7 +2880,7 @@ class HookExecutor:
         instance to avoid repeated filesystem reads during hook rendering.
         """
         if self._init_options_cache is None:
-            from . import load_init_options
+            from .. import load_init_options
 
             payload = load_init_options(self.project_root)
             self._init_options_cache = payload if isinstance(payload, dict) else {}
@@ -2884,17 +2909,17 @@ class HookExecutor:
         selected_ai = init_options.get("ai")
         ai_skills_enabled = is_ai_skills_enabled(init_options)
 
-        codex_skill_mode = selected_ai == "codex" and ai_skills_enabled
+        dollar_skill_mode = is_dollar_skills_agent(selected_ai, ai_skills_enabled)
         kimi_skill_mode = selected_ai == "kimi"
         cline_mode = selected_ai == "cline"
 
         skill_name = self._skill_name_from_command(command_id)
-        if codex_skill_mode and skill_name:
+        if dollar_skill_mode and skill_name:
             return f"${skill_name}"
         if kimi_skill_mode and skill_name:
             return f"/skill:{skill_name}"
         if cline_mode:
-            from .integrations.cline import format_cline_command_name
+            from ..integrations.cline import format_cline_command_name
 
             return f"/{format_cline_command_name(command_id)}"
 

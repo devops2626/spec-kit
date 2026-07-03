@@ -50,7 +50,6 @@ class HermesIntegration(SkillsIntegration):
         "args": "$ARGUMENTS",
         "extension": "/SKILL.md",
     }
-    context_file = "AGENTS.md"
 
     # -- Helpers -----------------------------------------------------------
 
@@ -140,8 +139,8 @@ class HermesIntegration(SkillsIntegration):
                 self.key,
                 script_type,
                 arg_placeholder,
-                context_file=self.context_file or "",
                 invoke_separator=self.invoke_separator,
+                project_root=project_root,
             )
             # Strip the processed frontmatter — we rebuild it for skills.
             if processed_body.startswith("---"):
@@ -182,8 +181,6 @@ class HermesIntegration(SkillsIntegration):
             skill_file.write_bytes(normalized.encode("utf-8"))
             created.append(skill_file)
 
-        # Upsert managed context section into the agent context file
-        self.upsert_context_section(project_root)
 
         # Create project-local marker directory so extension commands
         # (e.g. git) can detect Hermes as an active integration.
@@ -203,8 +200,7 @@ class HermesIntegration(SkillsIntegration):
     ) -> tuple[list[Path], list[Path]]:
         """Uninstall integration files including global Hermes skills.
 
-        Removes the managed context section from AGENTS.md, removes the
-        project-local marker directory (if empty), delegates to
+        Removes the project-local marker directory (if empty), delegates to
         ``manifest.uninstall()`` for project-local tracked files, and
         removes all ``speckit-*`` skills under ``~/.hermes/skills/``.
 
@@ -212,8 +208,6 @@ class HermesIntegration(SkillsIntegration):
         standard integration behaviour where all files created by the
         integration are removed on ``specify integration uninstall``.
         """
-        # Remove managed context section from AGENTS.md
-        self.remove_context_section(project_root)
 
         # Delegate to manifest for project-local tracked files (scripts,
         # templates, context entries tracked in the manifest).

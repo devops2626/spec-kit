@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import typer
 
@@ -103,37 +103,16 @@ def _refresh_init_options_speckit_version(project_root: Path) -> None:
 
 
 def _clear_init_options_for_integration(project_root: Path, integration_key: str) -> None:
-    """Clear active integration keys from init-options.json when they match.
-
-    Also clears ``context_file`` from the agent-context extension config so
-    no stale path is left behind when the integration is uninstalled.
-    """
+    """Clear active integration keys from init-options.json when they match."""
     from .. import (
-        _AGENT_CTX_EXT_CONFIG,
-        _update_agent_context_config_file,
         load_init_options,
         save_init_options,
     )
     opts = load_init_options(project_root)
-    has_legacy_context_keys = ("context_file" in opts) or ("context_markers" in opts)
-    # Remove legacy fields that older versions may have written.
-    opts.pop("context_file", None)
-    opts.pop("context_markers", None)
-
     if opts.get("integration") == integration_key or opts.get("ai") == integration_key:
         opts.pop("integration", None)
         opts.pop("ai", None)
         opts.pop("ai_skills", None)
-        save_init_options(project_root, opts)
-        # Clear context_file in the extension config if it already exists.
-        # Avoid creating the config (and parent dirs) in projects where the
-        # agent-context extension was never installed.
-        ext_cfg_path = project_root / _AGENT_CTX_EXT_CONFIG
-        if ext_cfg_path.exists():
-            _update_agent_context_config_file(
-                project_root, "", preserve_markers=True
-            )
-    elif has_legacy_context_keys:
         save_init_options(project_root, opts)
 
 
@@ -274,19 +253,13 @@ def _update_init_options_for_integration(
     integration: Any,
     script_type: str | None = None,
 ) -> None:
-    """Update init-options.json and the agent-context extension config to
-    reflect *integration* as the active one.
+    """Update init-options.json to reflect *integration* as the active one.
 
-    ``context_file`` and ``context_markers`` are stored in the agent-context
-    extension config (``.specify/extensions/agent-context/agent-context-config.yml``),
-    not in ``init-options.json``.  Existing user-customised markers are
-    always preserved when the config already exists; invalid marker values
-    are silently ignored at runtime by ``_resolve_context_markers()`` which
-    falls back to the class-level defaults.
+    Agent context/instruction files are owned entirely by the opt-in
+    agent-context extension, so this function never touches the extension
+    or its config.
     """
     from .. import (
-        _AGENT_CTX_EXT_CONFIG,
-        _update_agent_context_config_file,
         load_init_options,
         save_init_options,
     )
@@ -294,9 +267,6 @@ def _update_init_options_for_integration(
     opts = load_init_options(project_root)
     opts["integration"] = integration.key
     opts["ai"] = integration.key
-    # Remove legacy fields if they were written by an older version.
-    opts.pop("context_file", None)
-    opts.pop("context_markers", None)
     opts["speckit_version"] = _get_speckit_version()
     if script_type:
         opts["script"] = script_type
@@ -304,24 +274,6 @@ def _update_init_options_for_integration(
         opts["ai_skills"] = True
     else:
         opts.pop("ai_skills", None)
-
-    # Update the agent-context extension config BEFORE init-options.json
-    # so a failure here doesn't leave init-options partially updated.
-    ext_cfg_path = project_root / _AGENT_CTX_EXT_CONFIG
-    if ext_cfg_path.exists():
-        _update_agent_context_config_file(
-            project_root,
-            integration.context_file,
-            preserve_markers=True,
-        )
-    elif integration.context_file:
-        # Extension config doesn't exist yet (extension not installed).
-        # Write defaults so scripts have something to read.
-        _update_agent_context_config_file(
-            project_root,
-            integration.context_file,
-            preserve_markers=False,
-        )
 
     save_init_options(project_root, opts)
 
@@ -383,6 +335,93 @@ def _set_default_integration_or_exit(*args: Any, **kwargs: Any) -> None:
     except _SharedTemplateRefreshError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Extension (un)registration helpers (shared by use / switch / upgrade)
+# ---------------------------------------------------------------------------
+
+def _best_effort_extension_op(
+    project_root: Path,
+    agent_key: str,
+    op: Callable[[Any, str], None],
+    *,
+    phase: str,
+    continuing: str,
+) -> None:
+    """Run a best-effort ``ExtensionManager`` operation for ``agent_key``.
+
+    ``op`` receives the ``ExtensionManager`` and ``agent_key``. Any failure is
+    surfaced as a warning via ``_print_cli_warning`` and never aborts the
+    surrounding integration operation. ``continuing`` describes what already
+    succeeded so the warning makes the partial outcome clear.
+    """
+    try:
+        from ..extensions import ExtensionManager
+
+        ext_mgr = ExtensionManager(project_root)
+        op(ext_mgr, agent_key)
+    except Exception as ext_err:
+        from .. import _print_cli_warning
+
+        _print_cli_warning(phase, "integration", agent_key, ext_err, continuing=continuing)
+
+
+def _register_extensions_for_agent(
+    project_root: Path,
+    agent_key: str,
+    *,
+    continuing: str,
+) -> None:
+    """Register all enabled extensions' commands/skills for ``agent_key``.
+
+    ``use`` / ``switch`` re-register enabled extensions for the agent they
+    activate; ``upgrade`` backfills them for the refreshed agent. Plain
+    ``install`` deliberately does not call this helper so adding a secondary
+    integration has no extension side effects until it is selected or upgraded.
+    See issue #2886.
+
+    Known limitation: extension *skill* rendering is scoped to the active
+    agent (init-options track a single ``ai`` / ``ai_skills`` pair). A
+    skills-mode agent registered while it is *not* the active agent (e.g.
+    Copilot ``--skills`` registered while non-active) therefore
+    receives command files rather than skills here — matching ``extension
+    add``'s multi-agent behavior. ``use`` / ``switch`` avoid this because they
+    make the target the active agent first. Per-agent skills parity is tracked in
+    #2948.
+
+    Best-effort: never aborts the surrounding integration operation. Callers
+    invoke it *after* the use/upgrade/switch transaction has committed so a
+    failure here cannot trigger a rollback.
+    """
+    _best_effort_extension_op(
+        project_root,
+        agent_key,
+        lambda mgr, key: mgr.register_enabled_extensions_for_agent(key),
+        phase="register extension artifacts for",
+        continuing=continuing,
+    )
+
+
+def _unregister_extensions_for_agent(
+    project_root: Path,
+    agent_key: str,
+    *,
+    continuing: str,
+) -> None:
+    """Best-effort removal of ``agent_key``'s extension artifacts.
+
+    Used by ``switch`` when uninstalling the previous integration so its
+    extension command/skill files don't linger as orphans in the old agent's
+    directory.
+    """
+    _best_effort_extension_op(
+        project_root,
+        agent_key,
+        lambda mgr, key: mgr.unregister_agent_artifacts(key),
+        phase="clean up extension artifacts for",
+        continuing=continuing,
+    )
 
 
 # ---------------------------------------------------------------------------

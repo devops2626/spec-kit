@@ -30,7 +30,8 @@ from packaging.specifiers import SpecifierSet, InvalidSpecifier
 from ..extensions import REINSTALL_COMMAND, ExtensionRegistry, normalize_priority
 from .._init_options import is_ai_skills_enabled
 from ..integrations.base import IntegrationBase
-from .._utils import dump_frontmatter
+from .._utils import dump_frontmatter, version_satisfies
+from ..shared_infra import verify_archive_sha256
 
 
 def _substitute_core_template(
@@ -571,19 +572,16 @@ class PresetManager:
             PresetCompatibilityError: If pack is incompatible
         """
         required = manifest.requires_speckit_version
-        current = pkg_version.Version(speckit_version)
-
         try:
-            specifier = SpecifierSet(required)
-            if current not in specifier:
-                raise PresetCompatibilityError(
-                    f"Preset requires spec-kit {required}, "
-                    f"but {speckit_version} is installed.\n"
-                    f"Upgrade spec-kit with: {REINSTALL_COMMAND}"
-                )
+            SpecifierSet(required)  # Just to validate
         except InvalidSpecifier:
+            raise PresetCompatibilityError(f"Invalid version specifier: {required}")
+
+        if not version_satisfies(speckit_version, required):
             raise PresetCompatibilityError(
-                f"Invalid version specifier: {required}"
+                f"Preset requires spec-kit {required}, "
+                f"but {speckit_version} is installed.\n"
+                f"Upgrade spec-kit with: {REINSTALL_COMMAND}"
             )
 
         return True
@@ -1064,11 +1062,14 @@ class PresetManager:
                         body = self._resolve_skill_command_refs(
                             body, registrar, selected_ai
                         )
+                    from ..integrations import get_integration
+                    integration = get_integration(selected_ai) if isinstance(selected_ai, str) else None
                     fm_data = registrar.build_skill_frontmatter(
                         selected_ai if isinstance(selected_ai, str) else "",
                         skill_name, desc,
                         f"override:{cmd_name}",
                     )
+                    registrar.apply_argument_hint(fm, fm_data, integration)
                     fm_text = dump_frontmatter(fm_data)
                     skill_title = self._skill_title_from_command(cmd_name)
                     skill_content = (
@@ -1076,8 +1077,6 @@ class PresetManager:
                         f"# Speckit {skill_title} Skill\n\n{body}\n"
                     )
                     # Apply integration post-processing (e.g. Claude flags)
-                    from ..integrations import get_integration
-                    integration = get_integration(selected_ai) if isinstance(selected_ai, str) else None
                     if integration is not None and hasattr(integration, "post_process_skill_content"):
                         skill_content = integration.post_process_skill_content(skill_content)
                     skill_file.write_text(skill_content, encoding="utf-8")
@@ -1346,6 +1345,7 @@ class PresetManager:
                     enhanced_desc,
                     f"preset:{manifest.id}",
                 )
+                registrar.apply_argument_hint(frontmatter, frontmatter_data, integration)
                 frontmatter_text = dump_frontmatter(frontmatter_data)
                 skill_content = (
                     f"---\n"
@@ -1442,6 +1442,7 @@ class PresetManager:
                     enhanced_desc,
                     f"templates/commands/{short_name}.md",
                 )
+                registrar.apply_argument_hint(frontmatter, frontmatter_data, integration)
                 frontmatter_text = dump_frontmatter(frontmatter_data)
                 skill_title = self._skill_title_from_command(short_name)
                 skill_content = (
@@ -1479,6 +1480,7 @@ class PresetManager:
                     frontmatter.get("description", f"Extension command: {command_name}"),
                     extension_restore["source"],
                 )
+                registrar.apply_argument_hint(frontmatter, frontmatter_data, integration)
                 frontmatter_text = dump_frontmatter(frontmatter_data)
                 skill_content = (
                     f"---\n"
@@ -1856,7 +1858,10 @@ class PresetCatalog:
                 f"Catalog URL must use HTTPS (got {parsed.scheme}://). "
                 "HTTP is only allowed for localhost."
             )
-        if not parsed.netloc:
+        # Check hostname, not netloc: netloc is truthy for host-less URLs like
+        # "https://:8080" or "https://user@", so the host guarantee this error
+        # promises would not actually hold. hostname is None in those cases (#3209).
+        if not parsed.hostname:
             raise PresetValidationError(
                 "Catalog URL must be a valid URL with a host."
             )
@@ -1887,10 +1892,19 @@ class PresetCatalog:
         download_url: str,
         timeout: int = 60,
     ) -> Optional[str]:
-        """Resolve a GitHub release asset URL to its REST API asset URL."""
+        """Resolve a GitHub release asset URL to its REST API asset URL.
+
+        Passes the ``github`` provider hosts from ``auth.json`` so GitHub
+        Enterprise Server release assets resolve via ``/api/v3``.
+        """
         from specify_cli._github_http import resolve_github_release_asset_api_url
+        from specify_cli.authentication.http import github_provider_hosts
+
         return resolve_github_release_asset_api_url(
-            download_url, self._open_url, timeout=timeout
+            download_url,
+            self._open_url,
+            timeout=timeout,
+            github_hosts=github_provider_hosts(),
         )
 
     def _validate_catalog_payload(self, catalog_data: Any, url: str) -> None:
@@ -2501,6 +2515,10 @@ class PresetCatalog:
             with self._open_url(download_url, timeout=60, extra_headers=extra_headers) as response:
                 zip_data = response.read()
 
+            verify_archive_sha256(
+                zip_data, pack_info.get("sha256"), pack_id, PresetError
+            )
+
             zip_path.write_bytes(zip_data)
             return zip_path
 
@@ -2703,7 +2721,7 @@ class PresetResolver:
         # (source-checkout / editable install).  This is the canonical home for
         # speckit's built-in command/template files and must always be checked
         # so that strategy:wrap presets can locate {CORE_TEMPLATE}.
-        from specify_cli import _locate_core_pack  # local import to avoid cycles
+        from specify_cli import _locate_core_pack, _repo_root  # local import to avoid cycles
         _core_pack = _locate_core_pack()
         if _core_pack is not None:
             # Wheel install path
@@ -2723,7 +2741,7 @@ class PresetResolver:
                 return candidate
         else:
             # Source-checkout / editable install: templates live at repo root
-            repo_root = Path(__file__).parent.parent.parent
+            repo_root = _repo_root()
             if template_type == "template":
                 candidate = repo_root / "templates" / f"{template_name}.md"
             elif template_type == "command":
@@ -3075,7 +3093,7 @@ class PresetResolver:
         ``.specify/templates/`` doesn't contain the core file.
         """
         try:
-            from specify_cli import _locate_core_pack
+            from specify_cli import _locate_core_pack, _repo_root
         except ImportError:
             return None
 
@@ -3098,7 +3116,7 @@ class PresetResolver:
                 if c.exists():
                     return c
         else:
-            repo_root = Path(__file__).parent.parent.parent
+            repo_root = _repo_root()
             for name in names:
                 if template_type == "template":
                     c = repo_root / "templates" / f"{name}.md"

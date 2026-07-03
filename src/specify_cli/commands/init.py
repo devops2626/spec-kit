@@ -18,7 +18,6 @@ from .._agent_config import (
     SCRIPT_TYPE_CHOICES,
 )
 from .._assets import (
-    _locate_bundled_extension,
     _locate_bundled_preset,
     _locate_bundled_workflow,
     get_speckit_version,
@@ -171,7 +170,6 @@ def register(app: typer.Typer) -> None:
         from .. import (
             _install_shared_infra_or_exit,
             _print_cli_warning,
-            _update_agent_context_config_file,
             ensure_executable_scripts,
             save_init_options,
         )
@@ -376,7 +374,6 @@ def register(app: typer.Typer) -> None:
             ("chmod", "Ensure scripts executable"),
             ("constitution", "Constitution setup"),
             ("workflow", "Install bundled workflow"),
-            ("agent-context", "Install agent-context extension"),
             ("final", "Finalize"),
         ]:
             tracker.add(key, label)
@@ -506,47 +503,6 @@ def register(app: typer.Typer) -> None:
                 ):
                     init_opts["ai_skills"] = True
                 save_init_options(project_path, init_opts)
-
-                # --- agent-context extension (bundled, auto-installed) ---
-                # Installed after init-options.json is written so that skill
-                # registration can read ai_skills + integration key.
-                try:
-                    from ..extensions import ExtensionManager as _ExtMgr
-
-                    bundled_ac = _locate_bundled_extension("agent-context")
-                    if bundled_ac:
-                        ac_mgr = _ExtMgr(project_path)
-                        if ac_mgr.registry.is_installed("agent-context"):
-                            tracker.complete("agent-context", "already installed")
-                        else:
-                            ac_mgr.install_from_directory(
-                                bundled_ac, get_speckit_version()
-                            )
-                            tracker.complete("agent-context", "extension installed")
-                    else:
-                        from ..extensions import REINSTALL_COMMAND as _ac_reinstall
-
-                        tracker.error(
-                            "agent-context",
-                            f"bundled extension not found — installation may be "
-                            f"incomplete. Run: {_ac_reinstall}",
-                        )
-                except Exception as ac_err:
-                    sanitized_ac = str(ac_err).replace("\n", " ").strip()
-                    tracker.error(
-                        "agent-context",
-                        f"extension install failed: {sanitized_ac[:120]}",
-                    )
-
-                # Write context_file to the agent-context extension config
-                # AFTER the extension install (which copies the template config
-                # with an empty context_file).
-                if resolved_integration.context_file:
-                    _update_agent_context_config_file(
-                        project_path,
-                        resolved_integration.context_file,
-                        preserve_markers=True,
-                    )
 
                 ensure_executable_scripts(project_path, tracker=tracker)
 
@@ -693,6 +649,7 @@ def register(app: typer.Typer) -> None:
         ) or getattr(resolved_integration, "_skills_mode", False)
 
         codex_skill_mode = selected_ai == "codex" and _is_skills_integration
+        zcode_skill_mode = selected_ai == "zcode" and _is_skills_integration
         claude_skill_mode = selected_ai == "claude" and _is_skills_integration
         kimi_skill_mode = selected_ai == "kimi"
         agy_skill_mode = selected_ai == "agy" and _is_skills_integration
@@ -706,6 +663,7 @@ def register(app: typer.Typer) -> None:
         cline_skill_mode = selected_ai == "cline"
         native_skill_mode = (
             codex_skill_mode
+            or zcode_skill_mode
             or claude_skill_mode
             or kimi_skill_mode
             or agy_skill_mode
@@ -719,6 +677,11 @@ def register(app: typer.Typer) -> None:
         if codex_skill_mode:
             steps_lines.append(
                 f"{step_num}. Start Codex in this project directory; spec-kit skills were installed to [cyan].agents/skills[/cyan]"
+            )
+            step_num += 1
+        if zcode_skill_mode:
+            steps_lines.append(
+                f"{step_num}. Start ZCode in this project directory; spec-kit skills were installed to [cyan].zcode/skills[/cyan]"
             )
             step_num += 1
         if claude_skill_mode:
@@ -743,7 +706,10 @@ def register(app: typer.Typer) -> None:
             step_num += 1
         usage_label = "skills" if native_skill_mode else "slash commands"
 
-        from .._invocation_style import is_slash_skills_agent as _is_slash_skills_agent
+        from .._invocation_style import (
+            is_dollar_skills_agent as _is_dollar_skills_agent,
+            is_slash_skills_agent as _is_slash_skills_agent,
+        )
 
         # `_is_skills_integration` means the integration is installed in
         # skills mode, which is the semantic equivalent of `ai_skills_enabled`
@@ -751,7 +717,7 @@ def register(app: typer.Typer) -> None:
         _ai_skills_enabled = _is_skills_integration
 
         def _display_cmd(name: str) -> str:
-            if codex_skill_mode:
+            if _is_dollar_skills_agent(selected_ai, _ai_skills_enabled):
                 return f"$speckit-{name}"
             if kimi_skill_mode:
                 return f"/skill:speckit-{name}"
