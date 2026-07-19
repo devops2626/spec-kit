@@ -746,11 +746,16 @@ def _resolve_manifest_path(path: Path | None) -> Path:
 def _download_manifest(resolved, *, offline: bool):
     """Resolve a bundle's manifest from its catalog ``download_url``.
 
-    Local/``file://`` URLs always work offline and may point at a ``.zip``
-    artifact, a bundle directory, or a ``bundle.yml`` (handled by
-    :func:`_local_manifest_source`). Remote ``https://`` URLs are fetched with
-    the shared authenticated, redirect-validated HTTP client, and only when not
-    ``--offline``.
+    Catalog ``download_url``s are HTTPS-only (``http`` allowed for localhost),
+    matching the extensions/presets/workflows catalog systems. Remote URLs are
+    fetched with the shared authenticated, redirect-validated HTTP client, and
+    only when not ``--offline``.
+
+    Local and ``file://`` sources are intentionally not resolved here: to
+    install a bundle from disk, pass the path positionally
+    (``specify bundle install ./path/to/bundle.yml`` — a bundle directory or a
+    ``.zip`` artifact also works), which :func:`_local_manifest_source` handles
+    before catalog resolution and which never touches ``download_url``.
     """
     from urllib.parse import urlparse
 
@@ -760,36 +765,63 @@ def _download_manifest(resolved, *, offline: bool):
             f"Catalog entry '{resolved.entry.id}' has no download_url; cannot resolve "
             "its manifest."
         )
-    parsed = urlparse(url)
+    # A malformed authority (e.g. an unclosed IPv6 bracket ``https://[::1``)
+    # makes urlparse raise ValueError. Surface it as the documented
+    # BundlerError, like the sibling ``_validate_remote_url``, rather than
+    # leaking a raw ValueError past the callers, which only catch BundlerError.
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        raise BundlerError(
+            f"Catalog entry '{resolved.entry.id}' has a malformed download_url: {url}"
+        ) from None
     scheme = parsed.scheme.lower()
 
-    # On Windows an absolute path like ``C:\bundle.yml`` parses with a
-    # single-letter ``scheme``; treat it as a local file, not a URL scheme.
+    # ``file://`` URLs and bare filesystem paths (including Windows drive paths
+    # like ``C:\bundle.yml``, which urlparse reads as a single-letter scheme)
+    # are not valid catalog download URLs. Catalog URLs are HTTPS-only across
+    # every catalog system; installing from disk is done by passing the path
+    # positionally, which never reaches URL resolution. Give an actionable
+    # error rather than accepting a scheme the rest of the codebase rejects.
     if scheme in ("", "file") or re.match(r"^[A-Za-z]:[\\/]", url):
-        local = Path(parsed.path if scheme == "file" else url)
-        manifest = _local_manifest_source(str(local))
-        if manifest is None:
-            raise BundlerError(f"Bundle manifest not found: {local}")
-        return manifest
+        raise BundlerError(
+            f"Catalog entry '{resolved.entry.id}' has a non-HTTP(S) download_url "
+            f"({url}); catalog download URLs must be HTTPS (http for localhost) — "
+            "a file:// URL, a local filesystem path, or a scheme-less value "
+            "(e.g. 'example.com/bundle.zip') is not accepted. "
+            "To install a bundle from disk, pass the path directly: "
+            "'specify bundle install <path-to-bundle.yml | bundle-dir | .zip>'."
+        )
 
-    if scheme in ("http", "https"):
-        if offline:
-            raise BundlerError(
-                f"Network access disabled; cannot download bundle '{resolved.entry.id}' "
-                f"from {url}."
-            )
-        return _download_remote_manifest(resolved.entry.id, url)
+    # Validate the scheme/host *before* the offline gate so an invalid or
+    # non-HTTPS download_url reports the real problem in every mode, rather
+    # than a misleading "Network access disabled" under --offline.
+    # (_download_remote_manifest re-checks this, but only once network access
+    # is permitted.) HTTPS-only, http allowed for localhost.
+    _require_https(f"bundle '{resolved.entry.id}'", url)
 
-    raise BundlerError(
-        f"Unsupported download_url scheme for bundle '{resolved.entry.id}': {url}"
-    )
+    if offline:
+        raise BundlerError(
+            f"Network access disabled; cannot download bundle '{resolved.entry.id}' "
+            f"from {url}."
+        )
+    return _download_remote_manifest(resolved.entry.id, url)
 
 
 def _require_https(label: str, url: str) -> None:
     from urllib.parse import urlparse
 
-    parsed = urlparse(url)
-    is_localhost = parsed.hostname in ("localhost", "127.0.0.1", "::1")
+    # urlparse / hostname access raise ValueError on a malformed authority;
+    # keep the documented BundlerError contract (older Pythons surface this via
+    # the .hostname access below rather than at the urlparse call).
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+    except ValueError:
+        raise BundlerError(
+            f"Refusing to download {label}: URL is malformed: {url}"
+        ) from None
+    is_localhost = hostname in ("localhost", "127.0.0.1", "::1")
     if parsed.scheme != "https" and not (parsed.scheme == "http" and is_localhost):
         raise BundlerError(
             f"Refusing to download {label} over non-HTTPS URL: {url}"
