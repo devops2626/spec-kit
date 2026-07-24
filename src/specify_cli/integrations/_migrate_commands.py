@@ -1,8 +1,9 @@
 """specify integration switch / upgrade command handlers."""
 from __future__ import annotations
 
+import json
 import os
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 import typer
 
@@ -34,16 +35,182 @@ from ._helpers import (
     _resolve_script_type,
     _set_default_integration,
     _set_default_integration_or_exit,
+    _unregister_enabled_extension_commands_for_agent,
     _unregister_extensions_for_agent,
     _update_init_options_for_integration,
     _write_integration_json,
 )
 
 
+def _manifest_tracks_skill_layout(manifest) -> bool:
+    """Return True when *manifest* tracks any skills-layout artifact.
+
+    A skill scaffold is written as ``.../speckit-<name>/SKILL.md``, so a
+    manifest whose tracked files include a ``/SKILL.md`` key is in the skills
+    layout; otherwise it is in the command layout. Used by ``upgrade`` to
+    detect a dual-mode agent (e.g. Bob) flipping between the legacy commands
+    layout and the skills layout so orphaned extension artifacts from the old
+    layout can be reconciled.
+    """
+    return any(str(rel).endswith("/SKILL.md") for rel in manifest.files)
+
+
+def _manifest_path_under(rel_path: str, root: str) -> bool:
+    """Return True when manifest key *rel_path* is inside project-relative *root*."""
+    normalized_root = PurePath(root).as_posix().strip("/")
+    normalized_rel = PurePath(rel_path).as_posix().strip("/")
+    if not normalized_root:
+        return False
+    return normalized_rel == normalized_root or normalized_rel.startswith(
+        f"{normalized_root}/"
+    )
+
+
+def _legacy_command_root_changed(
+    integration,
+    project_root: Path,
+    old_manifest,
+    new_manifest,
+) -> bool:
+    """Return True when command artifacts moved from legacy_dir to canonical dir."""
+    config = integration.registrar_config or {}
+    canonical = config.get("dir")
+    legacy = config.get("legacy_dir")
+    if (
+        not isinstance(canonical, str)
+        or not canonical.strip()
+        or not isinstance(legacy, str)
+        or not legacy.strip()
+        or PurePath(canonical).as_posix() == PurePath(legacy).as_posix()
+    ):
+        return False
+
+    canonical_dir = project_root / canonical
+    legacy_dir = project_root / legacy
+    if not canonical_dir.is_dir() or not legacy_dir.is_dir():
+        return False
+
+    old_had_legacy = any(
+        _manifest_path_under(rel, legacy) for rel in old_manifest.files
+    )
+    new_has_canonical = any(
+        _manifest_path_under(rel, canonical) for rel in new_manifest.files
+    )
+    return old_had_legacy and new_has_canonical
+
+
+def _legacy_command_root_upgrade_pending(integration, old_manifest) -> bool:
+    """Return True when the old manifest tracks command files under legacy_dir."""
+    config = integration.registrar_config or {}
+    canonical = config.get("dir")
+    legacy = config.get("legacy_dir")
+    if (
+        not isinstance(canonical, str)
+        or not canonical.strip()
+        or not isinstance(legacy, str)
+        or not legacy.strip()
+        or PurePath(canonical).as_posix() == PurePath(legacy).as_posix()
+    ):
+        return False
+    return any(_manifest_path_under(rel, legacy) for rel in old_manifest.files)
+
+
+class _PresetRegistryUnreadableError(Exception):
+    """Raised when an existing preset registry cannot be read or parsed.
+
+    Distinct from a *genuinely absent* registry (no presets installed): an
+    unreadable registry means we cannot verify whether preset overrides would
+    be orphaned by a layout change, so the migration must be rejected rather
+    than proceeding on a false "no presets" assumption.
+    """
+
+
+def _installed_presets_affecting_agent(
+    project_root,
+    agent_key: str,
+    *,
+    include_skills: bool = True,
+) -> list[str]:
+    """Return IDs of installed presets with artifacts registered for *agent_key*.
+
+    Presets register command overrides for every detected agent and mirror
+    skills for the active skills agent, tracking the result in each preset's
+    ``registered_commands`` / ``registered_skills`` metadata. There is no
+    agent-scoped preset re-registration mechanism, so a command↔skills *layout
+    change* cannot reconcile those artifacts (see ``integration_upgrade``).
+    Callers use this to detect the unsafe case and reject the migration rather
+    than silently orphaning preset files / leaving stale registry entries.
+
+    Fails **closed**: a genuinely absent registry (no presets ever installed)
+    returns an empty list, but if the registry file exists and cannot be read
+    or parsed (e.g. a permission error or corruption) this raises
+    :class:`_PresetRegistryUnreadableError`.  Reporting "no presets" in that
+    case would let a ``--force`` layout-changing upgrade delete
+    preset-overridden files while their registry state can't be reconciled —
+    the exact inconsistency the guard exists to prevent.
+    """
+    from ..presets import PresetRegistry
+
+    registry_path = (
+        Path(project_root) / ".specify" / "presets" / PresetRegistry.REGISTRY_FILE
+    )
+    # Genuinely absent registry → no presets installed → safe to proceed.
+    if not registry_path.exists():
+        return []
+
+    # The registry exists: any failure to read or parse it must surface as an
+    # error, not be swallowed into an empty ("no presets") result.
+    try:
+        data = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise _PresetRegistryUnreadableError(str(exc)) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("presets", {}), dict):
+        raise _PresetRegistryUnreadableError(
+            "preset registry structure is malformed"
+        )
+
+    affected: list[str] = []
+    for preset_id, meta in data.get("presets", {}).items():
+        # A malformed entry means we cannot verify whether this preset owns
+        # artifacts for the agent, so fail closed rather than skip it.
+        if not isinstance(meta, dict):
+            raise _PresetRegistryUnreadableError(
+                f"preset '{preset_id}' entry is malformed"
+            )
+        registered_commands = meta.get("registered_commands", {})
+        if not isinstance(registered_commands, dict):
+            raise _PresetRegistryUnreadableError(
+                f"preset '{preset_id}' registered_commands is malformed"
+            )
+        registered_skills = meta.get("registered_skills", [])
+        if include_skills:
+            if not isinstance(registered_skills, (list, tuple)):
+                raise _PresetRegistryUnreadableError(
+                    f"preset '{preset_id}' registered_skills is malformed"
+                )
+        has_commands = bool(registered_commands.get(agent_key))
+        has_skills = include_skills and bool(registered_skills)
+        if has_commands or has_skills:
+            affected.append(preset_id)
+    return affected
+
+
+def _installed_command_presets_affecting_agent(
+    project_root,
+    agent_key: str,
+) -> list[str]:
+    """Return installed presets with command artifacts registered for *agent_key*."""
+    return _installed_presets_affecting_agent(
+        project_root,
+        agent_key,
+        include_skills=False,
+    )
+
+
 @integration_app.command("switch")
 def integration_switch(
     target: str = typer.Argument(help="Integration key to switch to"),
-    script: str | None = typer.Option(None, "--script", help="Script type: sh or ps (default: from init-options.json or platform default)"),
+    script: str | None = typer.Option(None, "--script", help="Script type: sh, ps, or py (default: from init-options.json or platform default)"),
     force: bool = typer.Option(False, "--force", help="Force removal of modified files during uninstall of the previous integration"),
     refresh_shared_infra: bool = typer.Option(False, "--refresh-shared-infra", help="Also overwrite shared infrastructure files even if you customized them (otherwise customizations are preserved)"),
     integration_options: str | None = typer.Option(None, "--integration-options", help='Options for the target integration'),
@@ -236,7 +403,8 @@ def integration_switch(
         force=refresh_shared_infra,
         refresh_managed=True,
         invoke_separator=_invoke_separator_for_integration(
-            target_integration, current, target, parsed_options
+            target_integration, current, target, parsed_options,
+            project_root=project_root,
         ),
         refresh_hint=(
             "To overwrite customizations, re-run with "
@@ -336,7 +504,7 @@ def integration_switch(
 def integration_upgrade(
     key: str | None = typer.Argument(None, help="Integration key to upgrade (default: current integration)"),
     force: bool = typer.Option(False, "--force", help="Force upgrade even if files are modified"),
-    script: str | None = typer.Option(None, "--script", help="Script type: sh or ps (default: from init-options.json or platform default)"),
+    script: str | None = typer.Option(None, "--script", help="Script type: sh, ps, or py (default: from init-options.json or platform default)"),
     integration_options: str | None = typer.Option(None, "--integration-options", help="Options for the integration"),
 ):
     """Upgrade an integration by reinstalling with diff-aware file handling.
@@ -398,6 +566,110 @@ def integration_upgrade(
         integration, current, key, integration_options
     )
 
+    legacy_command_root_upgrade_pending = _legacy_command_root_upgrade_pending(
+        integration,
+        old_manifest,
+    )
+
+    # Guard: Kilo's legacy command root moves from .kilocode/workflows to
+    # .kilo/commands. Preset command artifacts are registered only during
+    # preset install/remove, with no agent-scoped re-registration hook to
+    # recreate them at the new command root while preserving priority and
+    # composition semantics. Refuse before setup writes .kilo/commands rather
+    # than leaving legacy preset files orphaned or registry-tracked overrides
+    # missing from the canonical directory.
+    if key == "kilocode" and legacy_command_root_upgrade_pending:
+        config = integration.registrar_config or {}
+        legacy = config.get("legacy_dir", "legacy command directory")
+        canonical = config.get("dir", "canonical command directory")
+        try:
+            affected_presets = _installed_command_presets_affecting_agent(
+                project_root,
+                key,
+            )
+        except _PresetRegistryUnreadableError as exc:
+            console.print(
+                f"[red]Error:[/red] Cannot migrate '{key}' command directory "
+                f"from [cyan]{legacy}[/cyan] to [cyan]{canonical}[/cyan]: "
+                "the preset registry could not be read to verify installed presets."
+            )
+            console.print(f"[dim]Details:[/dim] {_cli_error_detail(exc)}")
+            console.print(
+                "A command directory migration cannot reconcile preset command "
+                "artifacts while the preset registry state is unknown. Fix or "
+                "restore [cyan].specify/presets/.registry[/cyan] and retry."
+            )
+            raise typer.Exit(1)
+        if affected_presets:
+            preset_list = ", ".join(sorted(affected_presets))
+            console.print(
+                f"[red]Error:[/red] Cannot migrate '{key}' command directory "
+                f"from [cyan]{legacy}[/cyan] to [cyan]{canonical}[/cyan] while "
+                f"preset override(s) are installed: [bold]{preset_list}[/bold]."
+            )
+            console.print(
+                "Preset command artifacts cannot yet be reconciled across this "
+                "command directory migration, so the upgrade is refused before "
+                "changing files."
+            )
+            console.print(
+                "Remove the preset(s), run the upgrade, then reinstall them:\n"
+                f"  [cyan]specify preset remove <id>[/cyan]\n"
+                f"  [cyan]specify integration upgrade {key} --script {selected_script} --force[/cyan]\n"
+                f"  [cyan]specify preset add <id>[/cyan]"
+            )
+            raise typer.Exit(1)
+
+    # Guard: reject a command↔skills layout change while preset overrides are
+    # installed for this agent (review #3415).  A dual-mode agent (e.g. Bob)
+    # can flip layout across an upgrade (``--skills`` / ``--legacy-commands``).
+    # Extension artifacts are reconciled after the flip (see below), but preset
+    # artifacts cannot be: there is no agent-scoped preset re-registration
+    # anywhere in the CLI, so migrating would delete a preset's old-layout
+    # files without recreating them in the new layout and leave the preset
+    # registry claiming artifacts that no longer exist.  Detect the intended
+    # layout (``is_skills_mode`` reflects the resolved flags/disk state, so a
+    # plain same-layout upgrade is unaffected) and bail out *before* any
+    # mutation with an actionable error so the project is never left in a
+    # half-migrated, inconsistent state.
+    if _manifest_tracks_skill_layout(old_manifest) != integration.is_skills_mode(
+        parsed_options, project_root
+    ):
+        try:
+            affected_presets = _installed_presets_affecting_agent(project_root, key)
+        except _PresetRegistryUnreadableError as exc:
+            console.print(
+                f"[red]Error:[/red] Cannot change '{key}' command layout: the "
+                f"preset registry could not be read to verify installed presets."
+            )
+            console.print(f"[dim]Details:[/dim] {_cli_error_detail(exc)}")
+            console.print(
+                "A layout change cannot reconcile preset artifacts, so the "
+                "migration is refused while the preset registry state is "
+                "unknown. Fix or restore "
+                "[cyan].specify/presets/.registry[/cyan] and retry."
+            )
+            raise typer.Exit(1)
+        if affected_presets:
+            preset_list = ", ".join(sorted(affected_presets))
+            console.print(
+                f"[red]Error:[/red] Cannot change '{key}' command layout while "
+                f"preset override(s) are installed: [bold]{preset_list}[/bold]."
+            )
+            console.print(
+                "Preset artifacts cannot yet be reconciled across a command↔skills "
+                "layout change, so the migration would orphan their files and leave "
+                "the preset registry inconsistent."
+            )
+            console.print(
+                "Remove the preset(s), run the upgrade, then reinstall them:\n"
+                f"  [cyan]specify preset remove <id>[/cyan]\n"
+                f"  [cyan]specify integration upgrade {key} "
+                f"--integration-options \"...\"[/cyan]\n"
+                f"  [cyan]specify preset add <id>[/cyan]"
+            )
+            raise typer.Exit(1)
+
     # Ensure shared infrastructure is up to date; --force overwrites existing files.
     infra_integration = integration
     infra_key = key
@@ -415,7 +687,8 @@ def integration_upgrade(
         selected_script,
         force=force,
         invoke_separator=_invoke_separator_for_integration(
-            infra_integration, current, infra_key, infra_parsed
+            infra_integration, current, infra_key, infra_parsed,
+            project_root=project_root,
         ),
     )
     if os.name != "nt":
@@ -441,6 +714,7 @@ def integration_upgrade(
             script_type=selected_script,
             raw_options=raw_options,
             parsed_options=parsed_options,
+            project_root=project_root,
         )
         if installed_key == key:
             try:
@@ -448,7 +722,8 @@ def integration_upgrade(
                     project_root,
                     selected_script,
                     invoke_separator=_invoke_separator_for_integration(
-                        integration, {"integration_settings": settings}, key, parsed_options
+                        integration, {"integration_settings": settings}, key, parsed_options,
+                        project_root=project_root,
                     ),
                     force=force,
                     refresh_managed=True,
@@ -463,7 +738,12 @@ def integration_upgrade(
         new_manifest.save()
         _write_integration_json(project_root, installed_key, installed_keys, settings)
         if installed_key == key:
-            _update_init_options_for_integration(project_root, integration, script_type=selected_script)
+            _update_init_options_for_integration(
+                project_root,
+                integration,
+                script_type=selected_script,
+                parsed_options=parsed_options,
+            )
         else:
             _refresh_init_options_speckit_version(project_root)
     except Exception as exc:
@@ -487,9 +767,33 @@ def integration_upgrade(
     if stale_keys:
         stale_manifest = IntegrationManifest(key, project_root, version="stale-cleanup")
         stale_manifest._files = {k: old_files[k] for k in stale_keys}
-        stale_removed, _ = stale_manifest.uninstall(project_root, force=True)
+        # remove_manifest=False: this throwaway manifest shares ``key`` with the
+        # real one just saved above (new_manifest.save()).  Letting uninstall()
+        # delete ``{key}.manifest.json`` would wipe the freshly-written manifest
+        # whenever an upgrade shrinks the tracked file set (e.g. Bob migrating
+        # from the legacy commands layout to skills), leaving the integration
+        # untracked and un-upgradeable.
+        stale_removed, _ = stale_manifest.uninstall(
+            project_root, force=True, remove_manifest=False
+        )
         if stale_removed:
             console.print(f"  Removed {len(stale_removed)} stale file(s) from previous install")
+
+    legacy_command_root_changed = _legacy_command_root_changed(
+        integration,
+        project_root,
+        old_manifest,
+        new_manifest,
+    )
+    if legacy_command_root_changed:
+        _unregister_enabled_extension_commands_for_agent(
+            project_root,
+            key,
+            continuing=(
+                "The integration command directory changed, but legacy enabled "
+                "extension artifacts may need manual cleanup."
+            ),
+        )
 
     # Re-register enabled extensions for the upgraded agent so its extension
     # commands are (re)created — including agents installed before this
@@ -497,6 +801,55 @@ def integration_upgrade(
     # Done after the upgrade has fully settled (Phase 2 included) and outside
     # the try/except above so this best-effort step cannot affect upgrade
     # success.
+    #
+    # Layout-change reconciliation: a dual-mode agent (e.g. Bob) can flip
+    # between the legacy commands layout and the skills layout across an
+    # upgrade (``upgrade bob --integration-options "--skills"`` / reverse
+    # ``--legacy-commands``). Phase 2 above only removes stale files tracked by
+    # the *integration* manifest (core commands); extension artifacts are
+    # tracked separately in the extension registry, so the old layout's
+    # extension command/skill files would otherwise linger as orphans. When the
+    # layout actually changed, first unregister the agent's extension artifacts
+    # (removing old-layout files and clearing per-agent registry entries) so the
+    # re-registration below recreates them in the new layout. ``upgrade``s that
+    # don't change layout skip this to avoid needless remove/re-add churn.
+    #
+    # Only the *active* integration is reconciled this way (``installed_key ==
+    # key``).  ``ExtensionManager.unregister_agent_artifacts`` treats the
+    # per-extension ``registered_skills`` list as belonging to the passed agent
+    # and, when that agent's skills directory is absent, falls back to scanning
+    # every agent's skills directory — so running it for a *secondary*
+    # (non-active) agent could delete or untrack the *active* agent's extension
+    # skills.  The subsequent re-registration cannot repair that because
+    # extension skill rendering is intentionally scoped to the active agent
+    # (#2948).  Extension skills only ever exist for the active agent, so
+    # skipping the unregister for a secondary agent orphans nothing new: a
+    # secondary agent only has extension *command* files, which the
+    # re-registration below rewrites in place regardless of layout.
+    #
+    # Known limitation: preset command/skill artifacts are NOT reconciled on a
+    # layout change. There is no agent-scoped preset re-registration mechanism
+    # anywhere in the CLI — ``use`` / ``switch`` / ``upgrade`` never reconcile
+    # presets for any agent (presets are only (un)registered at preset
+    # install/remove time). Rather than silently orphan them, the guard near
+    # the top of this function rejects a layout-changing upgrade while preset
+    # overrides are installed, so control only reaches here (with a changed
+    # layout) when no preset artifacts are at stake. Full preset reconciliation
+    # would require a new cross-cutting PresetManager subsystem affecting every
+    # dual-layout agent, which is out of scope for this Bob migration.
+    if (
+        installed_key == key
+        and _manifest_tracks_skill_layout(old_manifest)
+        != _manifest_tracks_skill_layout(new_manifest)
+    ):
+        _unregister_extensions_for_agent(
+            project_root,
+            key,
+            continuing=(
+                "The integration layout changed, but old-layout extension "
+                "artifacts may need manual cleanup."
+            ),
+        )
     _register_extensions_for_agent(
         project_root,
         key,
