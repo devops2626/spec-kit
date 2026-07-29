@@ -2490,6 +2490,33 @@ class TestIfThenStep:
         errors = step.validate({"id": "test", "then": []})
         assert any("missing 'condition'" in e for e in errors)
 
+    @pytest.mark.parametrize("bad", [["a", "b"], {"k": "v"}, 5, 1.5])
+    def test_validate_rejects_non_string_condition(self, bad):
+        # A list/dict/number condition is returned unchanged by
+        # evaluate_expression, and evaluate_condition then bool()-coerces it, so
+        # it silently resolves to its truthiness (e.g. [1, 2] is always True)
+        # instead of erroring on the authoring mistake.
+        from specify_cli.workflows.steps.if_then import IfThenStep
+
+        step = IfThenStep()
+        errors = step.validate({"id": "test", "condition": bad, "then": []})
+        assert any("'condition' must be a" in e for e in errors), bad
+
+    @pytest.mark.parametrize(
+        "good",
+        [
+            "true", "false", "{{ inputs.flag }}",
+            True, False,  # unquoted YAML bool: resolved exactly, and it is the
+                          # default this step itself uses -- must stay valid
+        ],
+    )
+    def test_validate_accepts_string_or_bool_condition(self, good):
+        from specify_cli.workflows.steps.if_then import IfThenStep
+
+        step = IfThenStep()
+        errors = step.validate({"id": "test", "condition": good, "then": []})
+        assert not any("'condition' must be a" in e for e in errors), good
+
     @pytest.mark.parametrize("bad_branch", [{"id": "x"}, "oops", 5])
     def test_execute_non_list_then_fails_loudly(self, bad_branch):
         """A non-list ``then`` must fail the step, not crash the run.
@@ -2880,6 +2907,24 @@ class TestWhileStep:
         assert any("missing 'condition'" in e for e in errors)
         # max_iterations is optional (defaults to 10)
 
+    @pytest.mark.parametrize("bad", [["a", "b"], {"k": "v"}, 5, 1.5])
+    def test_validate_rejects_non_string_condition(self, bad):
+        from specify_cli.workflows.steps.while_loop import WhileStep
+
+        step = WhileStep()
+        errors = step.validate({"id": "test", "condition": bad, "steps": []})
+        assert any("'condition' must be a" in e for e in errors), bad
+
+    @pytest.mark.parametrize("good", [True, False, "true", "{{ inputs.go }}"])
+    def test_validate_accepts_string_or_bool_condition(self, good):
+        # ``condition: false`` unquoted is idiomatic YAML and is this step's own
+        # default, so a literal bool must not be rejected.
+        from specify_cli.workflows.steps.while_loop import WhileStep
+
+        step = WhileStep()
+        errors = step.validate({"id": "test", "condition": good, "steps": []})
+        assert not any("'condition' must be a" in e for e in errors), good
+
     def test_validate_invalid_max_iterations(self):
         from specify_cli.workflows.steps.while_loop import WhileStep
 
@@ -2993,6 +3038,24 @@ class TestDoWhileStep:
         errors = step.validate({"id": "test", "steps": []})
         assert any("missing 'condition'" in e for e in errors)
         # max_iterations is optional (defaults to 10)
+
+    @pytest.mark.parametrize("bad", [["a", "b"], {"k": "v"}, 5, 1.5])
+    def test_validate_rejects_non_string_condition(self, bad):
+        from specify_cli.workflows.steps.do_while import DoWhileStep
+
+        step = DoWhileStep()
+        errors = step.validate({"id": "test", "condition": bad, "steps": []})
+        assert any("'condition' must be a" in e for e in errors), bad
+
+    @pytest.mark.parametrize("good", [True, False, "true", "{{ inputs.go }}"])
+    def test_validate_accepts_string_or_bool_condition(self, good):
+        # ``condition: false`` unquoted is idiomatic YAML; evaluate_condition
+        # resolves a literal bool exactly, so it must not be rejected.
+        from specify_cli.workflows.steps.do_while import DoWhileStep
+
+        step = DoWhileStep()
+        errors = step.validate({"id": "test", "condition": good, "steps": []})
+        assert not any("'condition' must be a" in e for e in errors), good
 
     def test_validate_steps_not_list(self):
         from specify_cli.workflows.steps.do_while import DoWhileStep
@@ -3628,6 +3691,31 @@ class TestWorkflowDefinition:
         definition = WorkflowDefinition.from_string(block)
         resolved = WorkflowEngine()._resolve_inputs(definition, {})  # must not raise
         assert resolved == {}
+
+    @pytest.mark.parametrize(
+        "block", ["workflow:\nsteps: []\n", "workflow: hi\nsteps: []\n", "workflow: [a]\nsteps: []\n"]
+    )
+    def test_non_mapping_workflow_block_parses_then_validates(self, block):
+        # A present-but-non-mapping `workflow:` block must not crash construction
+        # with AttributeError; it should parse to an empty header so
+        # validate_workflow reports the missing id/name (it reads the parsed
+        # attributes, not the raw block).
+        from specify_cli.workflows.engine import WorkflowDefinition, validate_workflow
+
+        definition = WorkflowDefinition.from_string(block)  # must not raise
+        assert definition.id == ""
+        errors = validate_workflow(definition)
+        assert any("workflow.id" in e for e in errors)
+        # The RAW malformed value is preserved on .data (the guard only
+        # normalizes the local var, not self.data) — .data is what gets written
+        # back out when a definition is serialized. Assert it was NOT replaced
+        # with {} by comparing against the original parse and confirming it is
+        # still a non-mapping.
+        import yaml
+
+        raw_workflow = yaml.safe_load(block).get("workflow")
+        assert definition.data["workflow"] == raw_workflow
+        assert not isinstance(definition.data["workflow"], dict)
 
     def test_from_string_invalid(self):
         from specify_cli.workflows.engine import WorkflowDefinition
@@ -6334,6 +6422,57 @@ class TestWorkflowCatalog:
         assert len(entries) == 1
         assert entries[0].name == "custom"
 
+    @pytest.mark.parametrize("body", ["[]\n", "false\n", "0\n", "''\n"])
+    def test_falsy_non_mapping_config_rejected(self, project_dir, body):
+        """A FALSY non-mapping top-level config ([], false, 0, '') must raise,
+        like a truthy non-mapping (5, a bare list) already does. The previous
+        ``yaml.safe_load(...) or {}`` coerced these to {} and silently swallowed
+        them, diverging from the truthy case."""
+        from specify_cli.workflows.catalog import WorkflowCatalog, WorkflowValidationError
+
+        config_path = project_dir / ".specify" / "workflow-catalogs.yml"
+        config_path.write_text(body, encoding="utf-8")
+        catalog = WorkflowCatalog(project_dir)
+        with pytest.raises(WorkflowValidationError, match="expected a mapping"):
+            catalog._load_catalog_config(config_path)
+
+    @pytest.mark.parametrize("body", ["catalogs: {}\n", "catalogs: ''\n", "catalogs: 0\n", "catalogs: false\n"])
+    def test_falsy_non_list_catalogs_rejected(self, project_dir, body):
+        """A FALSY non-list ``catalogs:`` value must raise, like a truthy one
+        (``catalogs: 5``) already does. The shape check sat behind the emptiness
+        check, so these were silently swallowed as "no catalogs"."""
+        from specify_cli.workflows.catalog import WorkflowCatalog, WorkflowValidationError
+
+        config_path = project_dir / ".specify" / "workflow-catalogs.yml"
+        config_path.write_text(body, encoding="utf-8")
+        catalog = WorkflowCatalog(project_dir)
+        with pytest.raises(WorkflowValidationError, match="'catalogs' must be a list"):
+            catalog._load_catalog_config(config_path)
+
+    @pytest.mark.parametrize("body", ["catalogs:\n", "catalogs: []\n"])
+    def test_absent_or_empty_catalogs_is_noop(self, project_dir, body):
+        """An explicit ``catalogs:`` null or an empty list stays a valid no-op —
+        the layer contributes nothing and resolution falls through."""
+        from specify_cli.workflows.catalog import WorkflowCatalog
+
+        config_path = project_dir / ".specify" / "workflow-catalogs.yml"
+        config_path.write_text(body, encoding="utf-8")
+        catalog = WorkflowCatalog(project_dir)
+        assert catalog._load_catalog_config(config_path) is None
+
+    @pytest.mark.parametrize("body", ["", "# only a comment\n", "null\n", "~\n"])
+    def test_empty_or_null_config_is_noop(self, project_dir, body):
+        """An empty document, comment-only file, or explicit top-level null is a
+        valid no-op: the loader returns None so that config layer is skipped and
+        get_active_catalogs falls through to the next one. It must NOT be
+        confused with a falsy non-mapping, which raises."""
+        from specify_cli.workflows.catalog import WorkflowCatalog
+
+        config_path = project_dir / ".specify" / "workflow-catalogs.yml"
+        config_path.write_text(body, encoding="utf-8")
+        catalog = WorkflowCatalog(project_dir)
+        assert catalog._load_catalog_config(config_path) is None
+
     @pytest.mark.parametrize("bad_priority", [True, False, float("inf")])
     def test_config_priority_bool_or_inf_rejected(self, project_dir, bad_priority):
         """`priority: true` must not be silently coerced to 1, and `priority: .inf`
@@ -6373,6 +6512,7 @@ class TestWorkflowCatalog:
         [
             "https://[::1",              # unterminated IPv6 bracket
             "https://[not-an-ip]/x",     # bracketed non-IP host
+            "https://example.com:notaport/catalog.json",
         ],
     )
     def test_validate_url_malformed_raises_validation_error(self, project_dir, url):
@@ -6481,6 +6621,62 @@ class TestWorkflowCatalog:
         with pytest.raises(WorkflowCatalogError, match="HTTPS"):
             catalog._fetch_single_catalog(entry, force_refresh=True)
         assert captured["rv"] is not None
+
+    def test_fetch_rejects_oversized_catalog_response(
+        self, project_dir, monkeypatch
+    ):
+        from specify_cli.authentication import http as auth_http
+        from specify_cli.workflows import catalog as catalog_module
+        from specify_cli.workflows.catalog import (
+            WorkflowCatalog,
+            WorkflowCatalogEntry,
+            WorkflowCatalogError,
+        )
+
+        monkeypatch.setattr(catalog_module, "MAX_JSON_CATALOG_BYTES", 32)
+        requested_sizes: list[int] = []
+
+        class _FakeResponse:
+            def __init__(self):
+                self.body = b"x" * 64
+                self.offset = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def geturl(self):
+                return "https://example.com/catalog.json"
+
+            def read(self, size=-1):
+                requested_sizes.append(size)
+                assert size >= 0
+                chunk_size = min(size, 7)
+                chunk = self.body[self.offset : self.offset + chunk_size]
+                self.offset += len(chunk)
+                return chunk
+
+        monkeypatch.setattr(
+            auth_http,
+            "open_url",
+            lambda url, timeout=30, redirect_validator=None: _FakeResponse(),
+        )
+
+        catalog = WorkflowCatalog(project_dir)
+        entry = WorkflowCatalogEntry(
+            url="https://example.com/catalog.json",
+            name="test",
+            priority=1,
+            install_allowed=True,
+        )
+
+        with pytest.raises(WorkflowCatalogError, match="exceeds maximum size"):
+            catalog._fetch_single_catalog(entry, force_refresh=True)
+
+        assert requested_sizes
+        assert not catalog.cache_dir.exists()
 
     def test_add_catalog(self, project_dir):
         from specify_cli.workflows.catalog import WorkflowCatalog
@@ -6900,6 +7096,52 @@ class TestStepRegistryCustom:
 class TestStepCatalog:
     """Test StepCatalog catalog resolution."""
 
+    # -- Config shape guards ----------------------------------------------
+    # StepCatalog._load_catalog_config is a duplicated twin of
+    # WorkflowCatalog._load_catalog_config, so it needs its own coverage: a
+    # regression in one loader would not be caught by the other's tests.
+
+    @pytest.mark.parametrize("body", ["[]\n", "false\n", "0\n", "''\n"])
+    def test_falsy_non_mapping_config_rejected(self, project_dir, body):
+        """A FALSY non-mapping top level had the same ``or {}`` coercion, which
+        bypassed the isinstance guard. It must raise like a truthy non-mapping."""
+        from specify_cli.workflows.catalog import StepCatalog, StepValidationError
+
+        config_path = project_dir / ".specify" / "step-catalogs.yml"
+        config_path.write_text(body, encoding="utf-8")
+        catalog = StepCatalog(project_dir)
+        with pytest.raises(StepValidationError, match="expected a mapping"):
+            catalog._load_catalog_config(config_path)
+
+    @pytest.mark.parametrize(
+        "body", ["catalogs: {}\n", "catalogs: ''\n", "catalogs: 0\n", "catalogs: false\n"]
+    )
+    def test_falsy_non_list_catalogs_rejected(self, project_dir, body):
+        """...and the same nested guard: a FALSY non-list ``catalogs:`` value must
+        raise rather than being swallowed as "no catalogs"."""
+        from specify_cli.workflows.catalog import StepCatalog, StepValidationError
+
+        config_path = project_dir / ".specify" / "step-catalogs.yml"
+        config_path.write_text(body, encoding="utf-8")
+        catalog = StepCatalog(project_dir)
+        with pytest.raises(StepValidationError, match="'catalogs' must be a list"):
+            catalog._load_catalog_config(config_path)
+
+    @pytest.mark.parametrize(
+        "body",
+        ["", "# only a comment\n", "null\n", "~\n", "catalogs:\n", "catalogs: []\n"],
+    )
+    def test_empty_or_null_config_is_noop(self, project_dir, body):
+        """An empty document, explicit null, or absent/empty ``catalogs:`` stays a
+        valid no-op — the layer contributes nothing and resolution falls
+        through."""
+        from specify_cli.workflows.catalog import StepCatalog
+
+        config_path = project_dir / ".specify" / "step-catalogs.yml"
+        config_path.write_text(body, encoding="utf-8")
+        catalog = StepCatalog(project_dir)
+        assert catalog._load_catalog_config(config_path) is None
+
     def test_default_catalogs(self, project_dir, monkeypatch):
         from specify_cli.workflows.catalog import StepCatalog
 
@@ -6977,6 +7219,7 @@ class TestStepCatalog:
         [
             "https://[::1",              # unterminated IPv6 bracket
             "https://[not-an-ip]/x",     # bracketed non-IP host
+            "https://example.com:notaport/steps.json",
         ],
     )
     def test_validate_url_malformed_raises_validation_error(self, project_dir, url):
@@ -7077,6 +7320,62 @@ class TestStepCatalog:
         with pytest.raises(StepCatalogError, match="HTTPS"):
             catalog._fetch_single_catalog(entry, force_refresh=True)
         assert captured["rv"] is not None
+
+    def test_fetch_rejects_oversized_catalog_response(
+        self, project_dir, monkeypatch
+    ):
+        from specify_cli.authentication import http as auth_http
+        from specify_cli.workflows import catalog as catalog_module
+        from specify_cli.workflows.catalog import (
+            StepCatalog,
+            StepCatalogEntry,
+            StepCatalogError,
+        )
+
+        monkeypatch.setattr(catalog_module, "MAX_JSON_CATALOG_BYTES", 32)
+        requested_sizes: list[int] = []
+
+        class _FakeResponse:
+            def __init__(self):
+                self.body = b"x" * 64
+                self.offset = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def geturl(self):
+                return "https://example.com/steps.json"
+
+            def read(self, size=-1):
+                requested_sizes.append(size)
+                assert size >= 0
+                chunk_size = min(size, 7)
+                chunk = self.body[self.offset : self.offset + chunk_size]
+                self.offset += len(chunk)
+                return chunk
+
+        monkeypatch.setattr(
+            auth_http,
+            "open_url",
+            lambda url, timeout=30, redirect_validator=None: _FakeResponse(),
+        )
+
+        catalog = StepCatalog(project_dir)
+        entry = StepCatalogEntry(
+            url="https://example.com/steps.json",
+            name="test",
+            priority=1,
+            install_allowed=True,
+        )
+
+        with pytest.raises(StepCatalogError, match="exceeds maximum size"):
+            catalog._fetch_single_catalog(entry, force_refresh=True)
+
+        assert requested_sizes
+        assert not catalog.cache_dir.exists()
 
     def test_add_catalog(self, project_dir):
         from specify_cli.workflows.catalog import StepCatalog
@@ -7929,6 +8228,112 @@ class TestWorkflowInfoStepGraph:
         # by Rich as an unknown style tag.
         assert "[gate]" in result.output
 
+    def test_definition_metadata_fields_escaped(self, temp_dir, monkeypatch):
+        """Every metadata field printed from the workflow definition (name,
+        description, author, integration, input name/type) is untrusted
+        workflow.yml content. An unescaped `[...]` in any of them would be
+        parsed as a Rich style tag and silently swallowed, so bracketed text
+        must survive literally in the output."""
+        import types
+
+        from typer.testing import CliRunner
+        from specify_cli import app
+        from specify_cli.workflows.engine import WorkflowEngine
+
+        (temp_dir / ".specify" / "workflows").mkdir(parents=True)
+
+        fake = types.SimpleNamespace(
+            name="My [WF]",
+            id="my-wf",
+            version="1.0.0 [beta]",
+            author="Jane [Doe]",
+            description="Does [stuff] nicely",
+            default_integration="claude [code]",
+            inputs={"in [put]": {"type": "str [ing]", "required": True}},
+            steps=[],
+        )
+        monkeypatch.setattr(WorkflowEngine, "load_workflow", lambda self, wid: fake)
+        monkeypatch.chdir(temp_dir)
+
+        result = CliRunner().invoke(app, ["workflow", "info", "my-wf"])
+
+        assert result.exit_code == 0, result.output
+        # Each bracketed token must render literally rather than be consumed as
+        # an unknown Rich style tag.
+        assert "My [WF]" in result.output
+        assert "1.0.0 [beta]" in result.output
+        assert "Jane [Doe]" in result.output
+        assert "Does [stuff] nicely" in result.output
+        assert "claude [code]" in result.output
+        assert "in [put]" in result.output
+        assert "str [ing]" in result.output
+
+    def test_catalog_metadata_fields_escaped(self, temp_dir, monkeypatch):
+        """When the workflow is only found in the catalog (not on disk), its
+        catalog-derived fields (name, description, tags) are untrusted too and
+        must be escaped so bracketed content renders literally."""
+        from typer.testing import CliRunner
+        from specify_cli import app
+        from specify_cli.workflows.engine import WorkflowEngine
+        from specify_cli.workflows import catalog as catalog_mod
+
+        (temp_dir / ".specify" / "workflows").mkdir(parents=True)
+
+        def _not_on_disk(self, wid):
+            raise FileNotFoundError(wid)
+
+        monkeypatch.setattr(WorkflowEngine, "load_workflow", _not_on_disk)
+        monkeypatch.setattr(
+            catalog_mod.WorkflowCatalog,
+            "get_workflow_info",
+            lambda self, wid: {
+                "name": "Cat [WF]",
+                "version": "2.0.0 [rc]",
+                "description": "From [catalog]",
+                "tags": ["a [b]", "c [d]"],
+            },
+        )
+        monkeypatch.chdir(temp_dir)
+
+        result = CliRunner().invoke(app, ["workflow", "info", "cat-wf"])
+
+        assert result.exit_code == 0, result.output
+        assert "Cat [WF]" in result.output
+        assert "2.0.0 [rc]" in result.output
+        assert "From [catalog]" in result.output
+        assert "a [b]" in result.output
+        assert "c [d]" in result.output
+
+    def test_not_found_id_escaped(self, temp_dir, monkeypatch):
+        """When the workflow is neither on disk nor in the catalog, the
+        not-found error echoes the requested ID. That ID is user input, so a
+        bracketed value must render literally instead of being parsed (and
+        swallowed) as a Rich style tag."""
+        from typer.testing import CliRunner
+        from specify_cli import app
+        from specify_cli.workflows.engine import WorkflowEngine
+        from specify_cli.workflows import catalog as catalog_mod
+
+        (temp_dir / ".specify" / "workflows").mkdir(parents=True)
+
+        def _not_on_disk(self, wid):
+            raise FileNotFoundError(wid)
+
+        monkeypatch.setattr(WorkflowEngine, "load_workflow", _not_on_disk)
+        monkeypatch.setattr(
+            catalog_mod.WorkflowCatalog,
+            "get_workflow_info",
+            lambda self, wid: None,
+        )
+        monkeypatch.chdir(temp_dir)
+
+        result = CliRunner().invoke(app, ["workflow", "info", "ghost [wf]"])
+
+        assert result.exit_code == 1, result.output
+        assert "not found" in result.output
+        # The bracketed ID must survive literally, not be eaten as markup.
+        assert "ghost [wf]" in result.output
+
 
 class TestWorkflowAddSymlinkGuard:
     def test_add_malformed_ipv6_url_exits_cleanly(self, temp_dir, monkeypatch):
@@ -8283,6 +8688,269 @@ class TestWorkflowStepAddCLI:
         assert not (
             project_dir / ".specify" / "workflows" / "steps" / "my-step"
         ).exists()
+
+    @pytest.mark.parametrize(
+        ("catalog_fields", "expected"),
+        [
+            ({"url": 123}, "malformed step.yml URL"),
+            (
+                {
+                    "step_yml_url": [],
+                    "url": "https://example.com/step.yml",
+                },
+                "malformed step.yml URL",
+            ),
+            (
+                {
+                    "url": "https://example.com/step.yml",
+                    "init_url": 123,
+                },
+                "malformed __init__.py URL",
+            ),
+        ],
+    )
+    def test_add_rejects_non_string_required_urls_before_network(
+        self, project_dir, monkeypatch, catalog_fields, expected
+    ):
+        from typer.testing import CliRunner
+
+        from specify_cli import app
+        from specify_cli.authentication import http as auth_http
+        from specify_cli.workflows.catalog import StepCatalog
+
+        monkeypatch.chdir(project_dir)
+        monkeypatch.setattr(
+            StepCatalog,
+            "get_step_info",
+            lambda self, step_id: {
+                "id": step_id,
+                "name": "Test Step",
+                "_install_allowed": True,
+                **catalog_fields,
+            },
+        )
+        monkeypatch.setattr(
+            auth_http,
+            "open_url",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("download should not start")
+            ),
+        )
+
+        result = CliRunner().invoke(
+            app, ["workflow", "step", "add", "my-step"]
+        )
+
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert expected in result.output
+        assert not (
+            project_dir / ".specify" / "workflows" / "steps" / "my-step"
+        ).exists()
+
+    @pytest.mark.parametrize(
+        ("alias", "protected_name"),
+        [
+            ("./step.yml", "step.yml"),
+            ("step.yml/", "step.yml"),
+            ("STEP.YML", "step.yml"),
+            (".\\step.yml", "step.yml"),
+            ("./__init__.py", "__init__.py"),
+            ("__init__.py/", "__init__.py"),
+            ("__INIT__.PY", "__init__.py"),
+            (".\\__init__.py", "__init__.py"),
+        ],
+    )
+    def test_add_does_not_overwrite_required_files_through_path_aliases(
+        self, project_dir, monkeypatch, alias, protected_name
+    ):
+        from typer.testing import CliRunner
+
+        from specify_cli import app
+        from specify_cli.authentication import http as auth_http
+        from specify_cli.workflows.catalog import StepCatalog
+
+        monkeypatch.chdir(project_dir)
+        alias_url = "https://example.com/overwrite"
+        monkeypatch.setattr(
+            StepCatalog,
+            "get_step_info",
+            lambda self, step_id: {
+                "id": step_id,
+                "name": "Test Step",
+                "url": "https://example.com/step.yml",
+                "init_url": "https://example.com/__init__.py",
+                "_install_allowed": True,
+                "extra_files": {alias: alias_url},
+            },
+        )
+        bodies = {
+            "https://example.com/step.yml": b"step:\n  type_key: my-step\n",
+            "https://example.com/__init__.py": b"# trusted init\n",
+        }
+        requested_urls: list[str] = []
+
+        class _FakeResponse:
+            def __init__(self, url):
+                self.url = url
+                self.body = bodies[url]
+                self.offset = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def geturl(self):
+                return self.url
+
+            def read(self, size=-1):
+                if size < 0:
+                    size = len(self.body) - self.offset
+                chunk = self.body[self.offset : self.offset + size]
+                self.offset += len(chunk)
+                return chunk
+
+        def fake_open_url(url, timeout=30, redirect_validator=None):
+            requested_urls.append(url)
+            return _FakeResponse(url)
+
+        monkeypatch.setattr(auth_http, "open_url", fake_open_url)
+
+        result = CliRunner().invoke(
+            app, ["workflow", "step", "add", "my-step"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert alias_url not in requested_urls
+        installed_dir = (
+            project_dir / ".specify" / "workflows" / "steps" / "my-step"
+        )
+        assert (installed_dir / protected_name).read_bytes() == bodies[
+            f"https://example.com/{protected_name}"
+        ]
+
+    def test_add_rejects_too_many_package_files_before_network(
+        self, project_dir, monkeypatch
+    ):
+        from typer.testing import CliRunner
+
+        from specify_cli import app
+        from specify_cli.authentication import http as auth_http
+        from specify_cli.workflows import _commands as workflow_commands
+        from specify_cli.workflows.catalog import StepCatalog
+
+        monkeypatch.chdir(project_dir)
+        monkeypatch.setattr(workflow_commands, "_MAX_STEP_PACKAGE_FILES", 3)
+        monkeypatch.setattr(
+            StepCatalog,
+            "get_step_info",
+            lambda self, step_id: {
+                "id": step_id,
+                "name": "Test Step",
+                "url": "https://example.com/step.yml",
+                "init_url": "https://example.com/__init__.py",
+                "_install_allowed": True,
+                "extra_files": {
+                    "one.py": "https://example.com/one.py",
+                    "two.py": "https://example.com/two.py",
+                },
+            },
+        )
+        monkeypatch.setattr(
+            auth_http,
+            "open_url",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("download should not start")
+            ),
+        )
+
+        result = CliRunner().invoke(
+            app, ["workflow", "step", "add", "my-step"]
+        )
+
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "exceeding the 3-file limit" in result.output
+        steps_dir = project_dir / ".specify" / "workflows" / "steps"
+        assert not (steps_dir / "my-step").exists()
+        assert list(steps_dir.glob("speckit_step_tmp_*")) == []
+
+    def test_add_rejects_package_over_cumulative_size_and_cleans_staging(
+        self, project_dir, monkeypatch
+    ):
+        from typer.testing import CliRunner
+
+        from specify_cli import app
+        from specify_cli.authentication import http as auth_http
+        from specify_cli.workflows import _commands as workflow_commands
+        from specify_cli.workflows.catalog import StepCatalog
+
+        monkeypatch.chdir(project_dir)
+        monkeypatch.setattr(workflow_commands, "_MAX_STEP_PACKAGE_BYTES", 40)
+        monkeypatch.setattr(
+            StepCatalog,
+            "get_step_info",
+            lambda self, step_id: {
+                "id": step_id,
+                "name": "Test Step",
+                "url": "https://example.com/step.yml",
+                "init_url": "https://example.com/__init__.py",
+                "_install_allowed": True,
+                "extra_files": {
+                    "helper.py": "https://example.com/helper.py",
+                },
+            },
+        )
+
+        bodies = {
+            "https://example.com/step.yml": b"step:\n  type_key: my-step\n",
+            "https://example.com/__init__.py": b"# init\n",
+            "https://example.com/helper.py": b"0123456789",
+        }
+
+        class _FakeResponse:
+            def __init__(self, url):
+                self.url = url
+                self.body = bodies[url]
+                self.offset = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def getheader(self, name):
+                return None
+
+            def geturl(self):
+                return self.url
+
+            def read(self, size=-1):
+                if size < 0:
+                    size = len(self.body) - self.offset
+                chunk = self.body[self.offset : self.offset + size]
+                self.offset += len(chunk)
+                return chunk
+
+        monkeypatch.setattr(
+            auth_http,
+            "open_url",
+            lambda url, timeout=30, redirect_validator=None: _FakeResponse(url),
+        )
+
+        result = CliRunner().invoke(
+            app, ["workflow", "step", "add", "my-step"]
+        )
+
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "40-byte total size limit" in result.output
+        steps_dir = project_dir / ".specify" / "workflows" / "steps"
+        assert not (steps_dir / "my-step").exists()
+        assert list(steps_dir.glob("speckit_step_tmp_*")) == []
 
     def test_add_rejects_non_string_extra_files_key(self, project_dir, monkeypatch):
         from typer.testing import CliRunner
@@ -9074,6 +9742,92 @@ steps:
         asset_calls = [(url, h) for url, h in captured_urls if "releases/assets/" in url]
         assert len(asset_calls) >= 1
         assert asset_calls[0][1] == {"Accept": "application/octet-stream"}
+
+
+class TestWorkflowStepStartProgressLine:
+    """The `run`/`resume` step-progress line must render the step id literally.
+
+    The line is built as `  ▸ [<id>] <label> …`, so Rich parsed the bracketed id
+    as a style tag: it silently swallowed the id (the only identifying content
+    on the line), applied it as formatting when the id happened to be a real
+    style like `bold`, and raised MarkupError — failing the whole run — when the
+    id formed a closing tag such as `/`. `validate_workflow` places no charset
+    restriction on step ids, so all of these are accepted workflows.
+    """
+
+    def _write(self, tmp_path, step_id):
+        path = tmp_path / "wf.yml"
+        path.write_text(
+            'schema_version: "1.0"\n'
+            "workflow:\n"
+            '  id: "probe-wf"\n'
+            '  name: "Probe"\n'
+            '  version: "1.0.0"\n'
+            "steps:\n"
+            f'  - id: "{step_id}"\n'
+            "    type: shell\n"
+            '    run: "exit 0"\n',
+            encoding="utf-8",
+        )
+        return path
+
+    @pytest.mark.parametrize("step_id", ["greet", "bold", "a]b"])
+    def test_progress_line_shows_step_id(self, tmp_path, monkeypatch, step_id):
+        from typer.testing import CliRunner
+        from specify_cli import app
+
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(
+            app, ["workflow", "run", str(self._write(tmp_path, step_id))]
+        )
+        assert result.exit_code == 0, result.stdout
+        assert f"[{step_id}]" in result.stdout
+
+    def test_step_id_forming_a_closing_tag_does_not_fail_the_run(
+        self, tmp_path, monkeypatch
+    ):
+        """`id: "/"` raised MarkupError from inside the progress callback, which
+        surfaced as a failed run with no step results."""
+        from typer.testing import CliRunner
+        from specify_cli import app
+
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(
+            app, ["workflow", "run", str(self._write(tmp_path, "/"))]
+        )
+        assert result.exit_code == 0, result.stdout
+        assert "Status: completed" in result.stdout
+        assert "[/]" in result.stdout
+
+    def test_resume_progress_line_shows_step_id(self, tmp_path, monkeypatch):
+        """`workflow resume` installs its own copy of the same callback, so it
+        needs independent coverage — a one-line fix would miss the twin."""
+        import json as _json
+
+        from typer.testing import CliRunner
+        from specify_cli import app
+
+        monkeypatch.chdir(tmp_path)
+        path = tmp_path / "wf.yml"
+        path.write_text(
+            'schema_version: "1.0"\n'
+            "workflow:\n"
+            '  id: "probe-resume"\n'
+            '  name: "Probe"\n'
+            '  version: "1.0.0"\n'
+            "steps:\n"
+            "  - id: boom\n"
+            "    type: shell\n"
+            '    run: "exit 1"\n',
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        first = runner.invoke(app, ["workflow", "run", str(path), "--json"])
+        run_id = _json.loads(first.stdout).get("run_id")
+        assert run_id
+
+        resumed = runner.invoke(app, ["workflow", "resume", run_id])
+        assert "[boom]" in resumed.stdout
 
 
 class TestWorkflowRunExitCodes:
@@ -10051,6 +10805,98 @@ steps:
         assert "Bracket [Search]" in result.output
         assert "desc [with] brackets" in result.output
         assert "tag[1]" in result.output
+
+    def test_search_and_info_tolerate_non_list_tags(self, project_dir, monkeypatch):
+        """A scalar ``tags:`` value must not crash the search/info display.
+
+        ``WorkflowCatalog.search`` guards its tag *filter* with
+        ``isinstance(raw_tags, list)``, but the ``workflow search`` and
+        ``workflow info`` display paths only tested truthiness before
+        iterating. ``tags: 5`` is truthy and not iterable, so both raised
+        ``TypeError: 'int' object is not iterable``.
+        """
+        from typer.testing import CliRunner
+        from specify_cli import app
+        from specify_cli.workflows.catalog import WorkflowCatalog
+
+        monkeypatch.chdir(project_dir)
+        workflows = {
+            "wf-a": {
+                "name": "Workflow A",
+                "version": "1.0.0",
+                "description": "desc",
+                "tags": 5,
+            },
+        }
+        monkeypatch.setattr(
+            WorkflowCatalog,
+            "_get_merged_workflows",
+            lambda self, force_refresh=False: {k: dict(v) for k, v in workflows.items()},
+        )
+        runner = CliRunner()
+        searched = runner.invoke(app, ["workflow", "search"])
+        info = runner.invoke(app, ["workflow", "info", "wf-a"])
+
+        assert searched.exit_code == 0, searched.output
+        assert "Workflow A" in searched.output
+        assert "Tags:" not in searched.output
+
+        assert info.exit_code == 0, info.output
+        assert "Tags:" not in info.output
+
+    def test_catalog_list_escapes_rich_markup(self, project_dir, monkeypatch):
+        """User-editable catalog name/url/description must not be parsed as Rich markup."""
+        from typer.testing import CliRunner
+        from specify_cli import app
+        from specify_cli.workflows.catalog import WorkflowCatalog
+
+        monkeypatch.chdir(project_dir)
+        configs = [
+            {
+                "name": "Bracket [Catalog]",
+                "url": "https://example.com/[cat].json",
+                "description": "desc [with] brackets",
+                "install_allowed": True,
+            },
+        ]
+        monkeypatch.setattr(
+            WorkflowCatalog,
+            "get_catalog_configs",
+            lambda self: [dict(c) for c in configs],
+        )
+        runner = CliRunner()
+        result = runner.invoke(app, ["workflow", "catalog", "list"])
+        assert result.exit_code == 0, result.output
+        assert "Bracket [Catalog]" in result.output
+        assert "https://example.com/[cat].json" in result.output
+        assert "desc [with] brackets" in result.output
+
+    def test_step_catalog_list_escapes_rich_markup(self, project_dir, monkeypatch):
+        """User-editable step-catalog name/url/description must not be parsed as Rich markup."""
+        from typer.testing import CliRunner
+        from specify_cli import app
+        from specify_cli.workflows.catalog import StepCatalog
+
+        monkeypatch.chdir(project_dir)
+        configs = [
+            {
+                "name": "Bracket [Step]",
+                "url": "https://example.com/[step].json",
+                "description": "step [with] brackets",
+                "install_allowed": True,
+            },
+        ]
+        monkeypatch.setattr(
+            StepCatalog,
+            "get_catalog_configs",
+            lambda self: [dict(c) for c in configs],
+        )
+        runner = CliRunner()
+        result = runner.invoke(app, ["workflow", "step", "catalog", "list"])
+        assert result.exit_code == 0, result.output
+        assert "Bracket [Step]" in result.output
+        assert "https://example.com/[step].json" in result.output
+        assert "step [with] brackets" in result.output
 
     # -- update ----------------------------------------------------------
 

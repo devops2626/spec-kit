@@ -14,13 +14,12 @@ from .. import BundlerError
 from ..lib.yamlio import dump_yaml, ensure_within, load_yaml
 from ..models.catalog import (
     CONFIG_FILENAME,
+    CONFIG_SCHEMA_VERSION,
     BUILTIN_DEFAULT_STACK,
     CatalogSource,
     InstallPolicy,
     Scope,
 )
-
-CONFIG_SCHEMA_VERSION = "1.0"
 
 _BUILTIN_IDS = {raw["id"] for raw in BUILTIN_DEFAULT_STACK}
 
@@ -153,6 +152,8 @@ def add_source(
         # keeps that ValueError inside the guard instead of leaking a raw
         # traceback past the CLI's `except BundlerError`. Reuse the value below.
         hostname = parsed.hostname
+        # Accessing ``port`` performs urllib's syntax/range validation.
+        _ = parsed.port
     except ValueError as exc:
         raise BundlerError(f"Invalid catalog url: '{url}'.") from exc
     if not (parsed.scheme or parsed.path):

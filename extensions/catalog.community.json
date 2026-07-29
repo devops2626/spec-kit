@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "updated_at": "2026-07-24T00:00:00Z",
+  "updated_at": "2026-07-28T00:00:00Z",
   "catalog_url": "https://raw.githubusercontent.com/github/spec-kit/main/extensions/catalog.community.json",
   "extensions": {
     "aide": {
@@ -1619,8 +1619,8 @@
       "id": "gates",
       "description": "Deterministic quality enforcement for Spec Kit across agent hooks, git checks, and CI pipelines with one policy file and one verify entrypoint for identical results at every boundary.",
       "author": "schwichtgit",
-      "version": "0.3.2",
-      "download_url": "https://github.com/schwichtgit/spec-gates/releases/download/v0.3.2/gates-0.3.2.zip",
+      "version": "0.3.3",
+      "download_url": "https://github.com/schwichtgit/spec-gates/releases/download/v0.3.3/gates-0.3.3.zip",
       "repository": "https://github.com/schwichtgit/spec-gates",
       "homepage": "https://github.com/schwichtgit/spec-gates",
       "documentation": "https://github.com/schwichtgit/spec-gates/blob/main/docs/how-it-works.md",
@@ -1664,7 +1664,7 @@
       "downloads": 0,
       "stars": 0,
       "created_at": "2026-07-09T00:00:00Z",
-      "updated_at": "2026-07-15T00:00:00Z"
+      "updated_at": "2026-07-27T00:00:00Z"
     },
     "github-issues": {
       "name": "GitHub Issues Integration 1",
@@ -2075,11 +2075,11 @@
       "id": "linear-weave",
       "description": "Weave Spec Kit into Linear: pull requirements, mirror tasks.md into sub-issues, sync statuses.",
       "author": "Tony Woodhouse",
-      "version": "1.0.0",
-      "download_url": "https://github.com/tonydwoodhouse/spec-kit-linear-weave/archive/refs/tags/v1.0.0.zip",
+      "version": "1.0.1",
+      "download_url": "https://github.com/tonydwoodhouse/spec-kit-linear-weave/archive/refs/tags/v1.0.1.zip",
       "repository": "https://github.com/tonydwoodhouse/spec-kit-linear-weave",
       "homepage": "https://github.com/tonydwoodhouse/spec-kit-linear-weave",
-      "documentation": "https://github.com/tonydwoodhouse/spec-kit-linear-weave#readme",
+      "documentation": "https://github.com/tonydwoodhouse/spec-kit-linear-weave/blob/main/README.md",
       "changelog": "https://github.com/tonydwoodhouse/spec-kit-linear-weave/blob/main/CHANGELOG.md",
       "license": "MIT",
       "category": "integration",
@@ -2102,7 +2102,7 @@
       "downloads": 0,
       "stars": 0,
       "created_at": "2026-07-21T00:00:00Z",
-      "updated_at": "2026-07-21T00:00:00Z"
+      "updated_at": "2026-07-27T00:00:00Z"
     },
     "loop": {
       "name": "Loop Engineering",
@@ -4818,36 +4818,40 @@
     "verify-review-ship": {
       "name": "Verify Review Ship",
       "id": "verify-review-ship",
-      "description": "Adds post-implementation verify, review, and ship readiness gates to Spec Kit workflows.",
+      "description": "Post-convergence operational verification, technical review, learning governance, and transactional delivery.",
       "author": "Carlos Eduardo Gevaerd Araujo",
-      "version": "0.1.0",
-      "download_url": "https://github.com/cadugevaerd/spec-kit-verify-review-ship/archive/refs/tags/v0.1.0.zip",
+      "version": "0.4.2",
+      "download_url": "https://github.com/cadugevaerd/spec-kit-verify-review-ship/archive/refs/tags/v0.4.2.zip",
+      "sha256": "71dceef5bf81d7ac54faa26bb5cf279554815a4928ee8d0c8e9bfb4c3e2bb0ab",
       "repository": "https://github.com/cadugevaerd/spec-kit-verify-review-ship",
       "homepage": "https://github.com/cadugevaerd/spec-kit-verify-review-ship",
       "documentation": "https://github.com/cadugevaerd/spec-kit-verify-review-ship/blob/main/README.md",
       "changelog": "https://github.com/cadugevaerd/spec-kit-verify-review-ship/blob/main/CHANGELOG.md",
       "license": "MIT",
       "category": "process",
-      "effect": "read-only",
+      "effect": "read-write",
       "requires": {
-        "speckit_version": ">=0.1.0"
+        "speckit_version": ">=0.11.2"
       },
       "provides": {
         "commands": 3,
-        "hooks": 1
+        "hooks": 0
       },
       "tags": [
         "quality",
         "review",
         "shipping",
-        "workflow",
-        "testing"
+        "merge",
+        "cleanup",
+        "learning",
+        "governance",
+        "agent-skills"
       ],
       "verified": false,
       "downloads": 0,
       "stars": 0,
       "created_at": "2026-07-10T00:00:00Z",
-      "updated_at": "2026-07-10T00:00:00Z"
+      "updated_at": "2026-07-28T00:00:00Z"
     },
     "verify-tasks": {
       "name": "Verify Tasks Extension",
