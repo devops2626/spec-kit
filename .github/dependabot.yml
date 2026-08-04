@@ -1,4 +1,4 @@
- updates:
+  updates:
 - directory: /
   package-ecosystem: pip
   schedule:
