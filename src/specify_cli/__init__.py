@@ -77,7 +77,9 @@ from ._version import (
 from ._agent_config import (
     AGENT_CONFIG as AGENT_CONFIG,
     DEFAULT_INIT_INTEGRATION as DEFAULT_INIT_INTEGRATION,
+    DEFAULT_INIT_INTEGRATION_ENV_VAR as DEFAULT_INIT_INTEGRATION_ENV_VAR,
     SCRIPT_TYPE_CHOICES as SCRIPT_TYPE_CHOICES,
+    resolve_default_init_integration as resolve_default_init_integration,
 )
 from ._init_options import (
     INIT_OPTIONS_FILE as INIT_OPTIONS_FILE,
@@ -513,6 +515,11 @@ _register_extension_cmds(app)
 # Moved to integrations/_commands.py — registered here to preserve CLI surface.
 from .integrations._commands import register as _register_integration_cmds  # noqa: E402
 _register_integration_cmds(app)
+
+
+# ===== Event Commands =====
+from .commands.event import register as _register_event_cmds  # noqa: E402
+_register_event_cmds(app)
 
 # Re-export selected helpers to preserve the public import surface.
 from .integrations._helpers import (  # noqa: E402

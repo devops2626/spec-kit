@@ -14,6 +14,7 @@ import pytest
 import io
 import json
 import tempfile
+import tarfile
 import shutil
 import warnings
 import zipfile
@@ -196,6 +197,121 @@ class TestPresetManifest:
             manifest_path.write_text(bad_content, encoding="utf-8")
             with pytest.raises(PresetValidationError, match="YAML mapping"):
                 PresetManifest(manifest_path)
+
+    @pytest.mark.parametrize("section", ["preset", "requires", "provides"])
+    @pytest.mark.parametrize("bad_value", [None, [], "text"])
+    def test_required_section_not_mapping_raises_validation_error(
+        self, temp_dir, valid_pack_data, section, bad_value
+    ):
+        """Required manifest sections reject null, list, and scalar values."""
+        valid_pack_data[section] = bad_value
+        manifest_path = temp_dir / "preset.yml"
+        manifest_path.write_text(
+            yaml.safe_dump(valid_pack_data),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            PresetValidationError,
+            match=rf"Invalid {section}: expected a mapping",
+        ):
+            PresetManifest(manifest_path)
+
+    @pytest.mark.parametrize("field", ["id", "name", "version", "description"])
+    @pytest.mark.parametrize("bad", [1.0, 5, None, ["a"], {"a": 1}, True])
+    def test_preset_metadata_field_not_string_raises_validation_error(
+        self, temp_dir, valid_pack_data, field, bad
+    ):
+        """A non-string preset.<field> raises PresetValidationError, not a raw
+        TypeError.
+
+        The loop over these four fields only checked key PRESENCE, then fed the
+        values to ``re.match`` (id) and ``packaging.Version`` (version), both of
+        which raise a bare TypeError on a non-string. YAML makes that an easy
+        authoring slip: unquoted ``version: 1.0`` parses as a float and ``id: 2``
+        as an int. TypeError is not a PresetValidationError, so it escaped
+        list_installed()'s "Corrupted preset" fallback and made
+        `specify preset list` exit 1 with a raw traceback, hiding every healthy
+        preset too. The sibling IntegrationDescriptor already type-checks the
+        same four fields.
+        """
+        valid_pack_data["preset"][field] = bad
+        manifest_path = temp_dir / "preset.yml"
+        manifest_path.write_text(yaml.safe_dump(valid_pack_data), encoding="utf-8")
+
+        with pytest.raises(
+            PresetValidationError,
+            match=rf"Invalid preset\.{field}: expected a string",
+        ):
+            PresetManifest(manifest_path)
+
+    @pytest.mark.parametrize("field", ["name", "file"])
+    @pytest.mark.parametrize("bad", [1.0, 5, None, ["a"], {"a": 1}, True])
+    def test_template_entry_field_not_string_raises_validation_error(
+        self, temp_dir, valid_pack_data, field, bad
+    ):
+        """A non-string template ``name``/``file`` raises PresetValidationError.
+
+        ``name`` reaches ``re.match`` and ``file`` reaches ``os.path.normpath``;
+        both raise a bare TypeError on a non-string. The sibling extension
+        manifest already rejects a non-string command ``file`` via
+        relative_extension_path_violation().
+        """
+        valid_pack_data["provides"]["templates"][0][field] = bad
+        manifest_path = temp_dir / "preset.yml"
+        manifest_path.write_text(yaml.safe_dump(valid_pack_data), encoding="utf-8")
+
+        with pytest.raises(
+            PresetValidationError,
+            match=rf"Invalid template {field}: expected a string",
+        ):
+            PresetManifest(manifest_path)
+
+    def test_one_bad_manifest_does_not_hide_healthy_presets(self, temp_dir):
+        """End-to-end guard for the symptom: an unquoted ``version: 1.0`` in one
+        installed preset must degrade to "Corrupted preset" and still let
+        list_installed() report the healthy ones, instead of raising TypeError
+        out of the whole call.
+        """
+        preset_root = temp_dir / ".specify" / "presets"
+        for pack_id, version in (("good-pack", '"1.0.0"'), ("bad-pack", "1.0")):
+            pack_path = preset_root / pack_id
+            pack_path.mkdir(parents=True, exist_ok=True)
+            (pack_path / "preset.yml").write_text(
+                f"""schema_version: "1.0"
+preset:
+  id: {pack_id}
+  name: {pack_id}
+  version: {version}
+  description: desc
+requires:
+  speckit_version: ">=0.1.0"
+provides:
+  templates:
+    - type: template
+      name: spec
+      file: templates/spec.md
+""",
+                encoding="utf-8",
+            )
+        (preset_root / ".registry").write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "presets": {
+                        "good-pack": {"version": "1.0.0", "enabled": True},
+                        "bad-pack": {"version": "1.0", "enabled": True},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        listed = {row["id"]: row for row in PresetManager(temp_dir).list_installed()}
+
+        assert set(listed) == {"good-pack", "bad-pack"}
+        assert "Corrupted" not in listed["good-pack"]["description"]
+        assert "Corrupted" in listed["bad-pack"]["description"]
 
     @pytest.mark.parametrize(
         "bad",
@@ -670,6 +786,27 @@ class TestPresetManager:
         assert manifest.id == "test-pack"
         assert manager.registry.is_installed("test-pack")
 
+    def test_install_from_zip_forwards_force(
+        self, project_dir, pack_dir, temp_dir
+    ):
+        """The compatibility wrapper must retain forced reinstall behavior."""
+        zip_path = temp_dir / "test-pack.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            for file_path in pack_dir.rglob("*"):
+                if file_path.is_file():
+                    zf.write(file_path, file_path.relative_to(pack_dir))
+
+        manager = PresetManager(project_dir)
+        manager.install_from_directory(pack_dir, "0.1.5")
+        manifest = manager.install_from_zip(
+            zip_path,
+            "0.1.5",
+            force=True,
+        )
+
+        assert manifest.id == "test-pack"
+        assert manager.registry.is_installed("test-pack")
+
     def test_install_from_zip_nested(self, project_dir, pack_dir, temp_dir):
         """Test installing from ZIP with nested directory."""
         zip_path = temp_dir / "test-pack.zip"
@@ -712,6 +849,45 @@ class TestPresetManager:
         manager = PresetManager(project_dir)
         with pytest.raises(PresetValidationError, match="Unsafe symlink"):
             manager.install_from_zip(zip_path, "0.1.5")
+
+        assert not manager.registry.is_installed("test-pack")
+
+    @pytest.mark.parametrize("suffix", [".tar.gz", ".tgz"])
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_install_from_tar_archive(
+        self, project_dir, pack_dir, temp_dir, suffix, nested
+    ):
+        """Tar archives install with the same flat/nested behavior as ZIP."""
+        archive_path = temp_dir / f"test-pack{suffix}"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for file_path in pack_dir.rglob("*"):
+                if file_path.is_file():
+                    relative = file_path.relative_to(pack_dir)
+                    arcname = Path("test-pack-v1") / relative if nested else relative
+                    archive.add(file_path, arcname=arcname)
+
+        manager = PresetManager(project_dir)
+        manifest = manager.install_from_archive(archive_path, "0.1.5")
+
+        assert manifest.id == "test-pack"
+        assert manager.registry.is_installed("test-pack")
+
+    def test_install_from_tar_rejects_symlink_entry(
+        self, project_dir, pack_dir, temp_dir
+    ):
+        archive_path = temp_dir / "symlink-preset.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            for file_path in pack_dir.rglob("*"):
+                if file_path.is_file():
+                    archive.add(file_path, arcname=file_path.relative_to(pack_dir))
+            link = tarfile.TarInfo("templates/escape")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../../outside"
+            archive.addfile(link)
+
+        manager = PresetManager(project_dir)
+        with pytest.raises(PresetValidationError, match="Unsafe symlink"):
+            manager.install_from_archive(archive_path, "0.1.5")
 
         assert not manager.registry.is_installed("test-pack")
 
@@ -2668,6 +2844,39 @@ class TestPresetCatalog:
         assert captured[0].get_header("Authorization") == "Bearer ghp_testtoken"
         assert captured[0].get_header("Accept") == "application/octet-stream"
 
+    @pytest.mark.parametrize("suffix", [".tar.gz", ".tgz"])
+    def test_download_pack_preserves_tar_archive_format(
+        self, project_dir, suffix
+    ):
+        from unittest.mock import patch, MagicMock
+
+        archive_buffer = io.BytesIO()
+        with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+            content = b"preset:\n  id: test-pack\n"
+            member = tarfile.TarInfo("preset.yml")
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+        archive_bytes = archive_buffer.getvalue()
+        response = MagicMock()
+        response.read.side_effect = io.BytesIO(archive_bytes).read
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        catalog = PresetCatalog(project_dir)
+        pack_info = {
+            "id": "test-pack",
+            "name": "Test Pack",
+            "version": "1.0.0",
+            "download_url": f"https://example.com/test-pack{suffix}",
+            "_install_allowed": True,
+        }
+
+        with patch.object(catalog, "get_pack_info", return_value=pack_info), \
+             patch.object(catalog, "_open_url", return_value=response):
+            archive_path = catalog.download_pack("test-pack", target_dir=project_dir)
+
+        assert archive_path.name == "test-pack-1.0.0.tar.gz"
+        assert archive_path.read_bytes() == archive_bytes
+
 
 # ===== Integration Tests =====
 
@@ -2825,6 +3034,80 @@ class TestPresetCatalogMultiCatalog:
         assert "Bracket [Catalog]" in result.output
         assert "https://example.com/[cat].json" in result.output
         assert "desc [with] brackets" in result.output
+
+    def test_catalog_add_escapes_rich_markup(self, project_dir):
+        """`preset catalog add` must not parse the name/url as Rich markup.
+
+        An unbalanced closing tag raised MarkupError *after* the entry was
+        already written to preset-catalogs.yml, so the user saw a traceback
+        and no confirmation for a catalog that had in fact been added.
+        """
+        from typer.testing import CliRunner
+        from unittest.mock import patch
+        from specify_cli import app
+
+        name = "[/red]my-catalog"
+        url = "https://example.com/[bold]c.json"
+        runner = CliRunner()
+        with patch.object(Path, "cwd", return_value=project_dir):
+            result = runner.invoke(
+                app, ["preset", "catalog", "add", url, "--name", name]
+            )
+        assert result.exit_code == 0, result.output
+        # Rendered verbatim, not swallowed as markup.
+        assert name in result.output
+        assert url in result.output
+        # Only rendering is escaped: the raw values still round-trip to disk.
+        config = yaml.safe_load(
+            (project_dir / ".specify" / "preset-catalogs.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert config["catalogs"][0]["name"] == name
+        assert config["catalogs"][0]["url"] == url
+
+    def test_catalog_remove_escapes_rich_markup(self, project_dir):
+        """`preset catalog remove` must not parse the name as Rich markup."""
+        from typer.testing import CliRunner
+        from unittest.mock import patch
+        from specify_cli import app
+
+        name = "[/red]my-catalog"
+        (project_dir / ".specify" / "preset-catalogs.yml").write_text(
+            yaml.dump({
+                "catalogs": [
+                    {
+                        "name": name,
+                        "url": "https://example.com/c.json",
+                        "priority": 1,
+                        "install_allowed": False,
+                    }
+                ]
+            }),
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        with patch.object(Path, "cwd", return_value=project_dir):
+            result = runner.invoke(app, ["preset", "catalog", "remove", name])
+        assert result.exit_code == 0, result.output
+        assert name in result.output
+
+    def test_catalog_remove_escapes_markup_in_not_found_error(self, project_dir):
+        """The not-found error path renders the name too."""
+        from typer.testing import CliRunner
+        from unittest.mock import patch
+        from specify_cli import app
+
+        (project_dir / ".specify" / "preset-catalogs.yml").write_text(
+            yaml.dump({"catalogs": []}), encoding="utf-8"
+        )
+        runner = CliRunner()
+        with patch.object(Path, "cwd", return_value=project_dir):
+            result = runner.invoke(
+                app, ["preset", "catalog", "remove", "[/red]absent"]
+            )
+        assert result.exit_code == 1
+        assert "[/red]absent" in result.output
 
     def test_env_var_overrides_catalogs(self, project_dir, monkeypatch):
         """Test that SPECKIT_PRESET_CATALOG_URL env var overrides defaults."""
@@ -4737,6 +5020,103 @@ class TestPresetSkills:
         assert "preset:self-test" not in content, "Preset content should be gone"
         assert "templates/commands/specify.md" in content, "Should reference core template"
         assert "disable-model-invocation: false" in content
+
+    def test_skill_restored_on_preset_remove_without_project_core_templates(self, project_dir):
+        """Removing a preset must restore core skills even when the project
+        has no ``.specify/templates/commands`` directory of its own — which
+        is the normal case, since ``specify init`` never populates it. The
+        real core commands live in the bundled core_pack/repo-root templates
+        tree, and restoration must fall back there instead of deleting the
+        skill outright (#3928).
+        """
+        self._write_init_options(project_dir, ai="claude")
+        skills_dir = project_dir / ".claude" / "skills"
+        self._create_skill(skills_dir, "speckit-specify")
+
+        # The project_dir fixture's commands dir is empty, matching a real
+        # project — specify init never populates project-local overrides
+        # for unmodified core commands.
+        core_cmds = project_dir / ".specify" / "templates" / "commands"
+        assert core_cmds.exists() and not any(core_cmds.iterdir())
+
+        manager = PresetManager(project_dir)
+        install_self_test_preset(manager)
+
+        skill_file = skills_dir / "speckit-specify" / "SKILL.md"
+        assert "preset:self-test" in skill_file.read_text(encoding="utf-8")
+
+        manager.remove("self-test")
+
+        assert skill_file.exists(), "Core skill must be restored, not deleted"
+        content = skill_file.read_text(encoding="utf-8")
+        assert "preset:self-test" not in content
+        assert "templates/commands/specify.md" in content
+        assert "Create or update the feature specification" in content
+
+    def test_extension_wins_over_bundled_core_on_preset_remove(
+        self, project_dir, monkeypatch
+    ):
+        """When an installed extension owns the same skill name as a core
+        command, removing a preset that overrode that skill must restore it
+        from the extension, not silently from the bundled core template.
+        Extensions are resolved ahead of bundled core elsewhere, and the
+        bundled-core fallback added for #3928 must not replace that
+        higher-priority layer.
+
+        The extension-command namespace rules (``speckit.<ext>.<command>``)
+        make a genuine end-to-end name collision with a core command
+        cumbersome to construct through real manifests, so this stubs
+        ``_build_extension_skill_restore_index`` to exercise the priority
+        ordering in ``_unregister_skills_in_dir`` directly -- the code path
+        under test doesn't care how the index entry was produced, only that
+        it wins over the bundled-core fallback when present.
+        """
+        self._write_init_options(project_dir, ai="claude")
+        skills_dir = project_dir / ".claude" / "skills"
+        self._create_skill(skills_dir, "speckit-specify")
+
+        # No project-local core template override — the normal case, and
+        # the one that makes the bundled-core fallback kick in at all.
+        core_cmds = project_dir / ".specify" / "templates" / "commands"
+        assert core_cmds.exists() and not any(core_cmds.iterdir())
+
+        extension_dir = project_dir / ".specify" / "extensions" / "fakeext"
+        (extension_dir / "commands").mkdir(parents=True, exist_ok=True)
+        ext_specify_file = extension_dir / "commands" / "specify.md"
+        ext_specify_file.write_text(
+            "---\ndescription: Extension specify command\n---\n\n"
+            "extension:fakeext specify body\n"
+        )
+
+        manager = PresetManager(project_dir)
+        install_self_test_preset(manager)
+
+        skill_file = skills_dir / "speckit-specify" / "SKILL.md"
+        assert "preset:self-test" in skill_file.read_text(encoding="utf-8")
+
+        fake_restore_index = {
+            "speckit-specify": {
+                "command_name": "speckit.fakeext.specify",
+                "source_file": ext_specify_file,
+                "source": "extension:fakeext",
+                "extension_id": "fakeext",
+                "extension_dir": extension_dir,
+            }
+        }
+        monkeypatch.setattr(
+            manager,
+            "_build_extension_skill_restore_index",
+            lambda: fake_restore_index,
+        )
+
+        manager.remove("self-test")
+
+        assert skill_file.exists()
+        content = skill_file.read_text(encoding="utf-8")
+        assert "preset:self-test" not in content
+        assert "source: extension:fakeext" in content
+        assert "extension:fakeext specify body" in content
+        assert "templates/commands/specify.md" not in content
 
     def test_skill_restored_on_remove_resolves_script_placeholders(self, project_dir):
         """Core restore should resolve {SCRIPT}/{ARGS} placeholders like other skill paths."""
@@ -10010,7 +10390,7 @@ class TestBundledPresetLocator:
                 self.read_sizes.append(size)
                 return super().read(size)
 
-        response = FakeResponse(b"zip-bytes")
+        response = FakeResponse(b"PK\x05\x06" + b"\x00" * 18)
         installed = {}
 
         def fake_install_from_zip(self, zip_path, speckit_version, priority=10):
@@ -10031,7 +10411,7 @@ class TestBundledPresetLocator:
 
         assert response.read_sizes
         assert installed == {
-            "zip_bytes": b"zip-bytes",
+            "zip_bytes": b"PK\x05\x06" + b"\x00" * 18,
             "speckit_version": "0.6.0",
             "priority": 7,
         }
@@ -11439,6 +11819,24 @@ class TestResolveContent:
 class TestCollectAllLayers:
     """Test PresetResolver.collect_all_layers() method."""
 
+    def test_non_utf8_legacy_command_keeps_replace_strategy(self, project_dir):
+        presets_dir = project_dir / ".specify" / "presets"
+        command_path = (
+            presets_dir / "legacy-pack" / "commands" / "speckit.legacy.md"
+        )
+        command_path.parent.mkdir(parents=True)
+        command_path.write_bytes(b"\xff\xfe")
+        PresetRegistry(presets_dir).add(
+            "legacy-pack", {"version": "1.0.0", "priority": 10}
+        )
+
+        layers = PresetResolver(project_dir).collect_all_layers(
+            "speckit.legacy", "command"
+        )
+
+        assert layers[0]["path"] == command_path
+        assert layers[0]["strategy"] == "replace"
+
     def test_single_core_layer(self, project_dir):
         """Test collecting layers with only core template."""
         resolver = PresetResolver(project_dir)
@@ -12209,3 +12607,296 @@ class TestPresetCatalogRichMarkup:
         ):
             value = self.MARKUP_PRESET[field]
             assert value in output
+        # Tags are joined into a single line, so assert on the rendered join.
+        assert ", ".join(self.MARKUP_PRESET["tags"]) in output
+
+
+class TestInstalledPresetRichMarkup:
+    """Locally installed preset metadata must render as literal text.
+
+    ``preset.yml`` is user-editable, so its fields can contain ``[...]``.
+    ``TestPresetCatalogRichMarkup`` covers the catalog branch of these
+    commands; the installed-preset branch of ``preset list``/``preset info``
+    and all of ``preset resolve`` were left unescaped, so a field like
+    ``Does [stuff] nicely`` silently rendered as ``Does  nicely`` and an
+    unbalanced tag such as ``[/red]`` raised ``rich.errors.MarkupError``,
+    aborting the command with a traceback.
+    """
+
+    MARKUP_FIELDS = {
+        "name": "[green]Markup Name[/green]",
+        "version": "1.0.0",
+        "description": "[yellow]Markup Description[/yellow]",
+        "author": "[magenta]Markup Author[/magenta]",
+        "repository": "[bold]Markup Repository[/bold]",
+        "license": "[cyan]Markup License[/cyan]",
+    }
+
+    def _install(self, temp_dir, project_dir, preset_overrides=None, strategy=None,
+                 pack_id="markup-pack", priority=10, tmpl_description=None):
+        """Install a preset from a directory built with the given manifest fields."""
+        from specify_cli.presets import PresetManager
+
+        src = temp_dir / f"src-{pack_id}"
+        (src / "templates").mkdir(parents=True)
+        (src / "templates" / "spec-template.md").write_text("# tmpl\n")
+
+        preset_section = {
+            "id": pack_id,
+            "name": pack_id,
+            "version": "1.0.0",
+            "description": "plain description",
+        }
+        preset_section.update(preset_overrides or {})
+        tmpl = {
+            "type": "template",
+            "name": "spec-template",
+            "file": "templates/spec-template.md",
+        }
+        if tmpl_description is not None:
+            tmpl["description"] = tmpl_description
+        if strategy:
+            tmpl["strategy"] = strategy
+        (src / "preset.yml").write_text(yaml.dump({
+            "schema_version": "1.0",
+            "preset": preset_section,
+            "requires": {"speckit_version": ">=0.0.1"},
+            "provides": {"templates": [tmpl]},
+            "tags": ["[italic]markup-tag[/italic]"],
+        }))
+
+        manager = PresetManager(project_dir)
+        manager.install_from_directory(src, "9.9.9", priority)
+        return manager
+
+    def _invoke(self, project_dir, args):
+        from typer.testing import CliRunner
+        from unittest.mock import patch
+        from specify_cli import app
+
+        with patch.object(Path, "cwd", return_value=project_dir):
+            return CliRunner().invoke(app, args)
+
+    def test_list_and_info_escape_installed_markup(self, temp_dir, project_dir):
+        """Every ``preset.yml`` field must survive verbatim in list/info output."""
+        self._install(temp_dir, project_dir, preset_overrides=self.MARKUP_FIELDS)
+
+        for args in (["preset", "list"], ["preset", "info", "markup-pack"]):
+            result = self._invoke(project_dir, args)
+            assert result.exit_code == 0, result.output
+            output = " ".join(strip_ansi(result.output).split())
+            # `preset list` does not render repository/license.
+            fields = ("name", "description") if args[1] == "list" else self.MARKUP_FIELDS
+            for field in fields:
+                assert self.MARKUP_FIELDS[field] in output, (field, args, output)
+            assert "[italic]markup-tag[/italic]" in output, (args, output)
+
+    def test_info_does_not_swallow_template_description(self, temp_dir, project_dir):
+        """The per-template line in ``preset info`` must escape the template description.
+
+        ``name``/``type`` are format-restricted by manifest validation, but
+        ``description`` is free-form, so it is the field that can carry markup.
+        """
+        self._install(
+            temp_dir,
+            project_dir,
+            tmpl_description="Template [desc] here",
+        )
+        result = self._invoke(project_dir, ["preset", "info", "markup-pack"])
+        assert result.exit_code == 0, result.output
+        output = " ".join(strip_ansi(result.output).split())
+        assert "spec-template (template): Template [desc] here" in output, output
+
+    def test_unbalanced_markup_does_not_crash_list_or_info(self, temp_dir, project_dir):
+        """An unbalanced tag must not raise MarkupError and abort the command."""
+        self._install(
+            temp_dir,
+            project_dir,
+            preset_overrides={"description": "Broken [/red] tag"},
+        )
+
+        for args in (["preset", "list"], ["preset", "info", "markup-pack"]):
+            result = self._invoke(project_dir, args)
+            assert result.exit_code == 0, (args, result.output, result.exception)
+            assert "Broken [/red] tag" in strip_ansi(result.output)
+
+    def test_resolve_escapes_template_name(self, project_dir):
+        """``preset resolve`` echoes its argument; an unbalanced tag must not crash."""
+        result = self._invoke(project_dir, ["preset", "resolve", "no[/red]such"])
+        assert result.exit_code == 0, (result.output, result.exception)
+        assert "no[/red]such" in strip_ansi(result.output)
+
+    def test_resolve_escapes_layer_path_and_source(self, project_dir):
+        """The top-layer path/source lines must render markup literally.
+
+        A preset can be installed from any directory, so the resolved path can
+        contain ``[...]``; the layer source carries the pack id and version.
+        """
+        from unittest.mock import patch
+        from specify_cli.presets import PresetResolver
+
+        # A closing tag cannot live inside a path segment: `Path` treats its
+        # `/` as a separator on POSIX and rewrites it to `\` on Windows. The
+        # opening tag covers the swallowing case for the path; the unbalanced
+        # closing tag rides on `source`, which is a plain string.
+        layer = {
+            "path": Path("/tmp/[red]dir/spec-template.md"),
+            "source": "pack [/red] v1.0.0",
+            "strategy": "replace",
+        }
+        with patch.object(PresetResolver, "collect_all_layers", return_value=[layer]):
+            result = self._invoke(project_dir, ["preset", "resolve", "spec-template"])
+
+        assert result.exit_code == 0, (result.output, result.exception)
+        output = " ".join(strip_ansi(result.output).split())
+        assert "[red]dir" in output, output
+        assert "pack [/red] v1.0.0" in output, output
+
+    def test_resolve_escapes_fallback_path_and_source(self, project_dir):
+        """The no-layer fallback branch must escape ``resolve_with_source`` output."""
+        from unittest.mock import patch
+        from specify_cli.presets import PresetResolver
+
+        with patch.object(
+            PresetResolver, "collect_all_layers", return_value=[]
+        ), patch.object(
+            PresetResolver,
+            "resolve_with_source",
+            return_value={
+                "path": "/tmp/[blue]fallback[/blue]/spec-template.md",
+                "source": "fallback [/red] source",
+            },
+        ):
+            result = self._invoke(project_dir, ["preset", "resolve", "spec-template"])
+
+        assert result.exit_code == 0, (result.output, result.exception)
+        output = " ".join(strip_ansi(result.output).split())
+        assert "[blue]fallback[/blue]" in output, output
+        assert "fallback [/red] source" in output, output
+
+    def test_resolve_escapes_composition_error(self, project_dir):
+        """A composition exception message must not be parsed as markup."""
+        from unittest.mock import patch
+        from specify_cli.presets import PresetResolver
+
+        layers = [
+            {
+                "path": Path("/tmp/top/spec-template.md"),
+                "source": "top-pack v1.0.0",
+                "strategy": "append",
+            },
+            {
+                "path": Path("/tmp/base/spec-template.md"),
+                "source": "base-pack v1.0.0",
+                "strategy": "append",
+            },
+        ]
+        with patch.object(
+            PresetResolver, "collect_all_layers", return_value=layers
+        ), patch.object(
+            PresetResolver,
+            "resolve_content",
+            side_effect=RuntimeError("compose failed: [/red] bad layer"),
+        ):
+            result = self._invoke(project_dir, ["preset", "resolve", "spec-template"])
+
+        assert result.exit_code == 0, (result.output, result.exception)
+        output = " ".join(strip_ansi(result.output).split())
+        assert "compose failed: [/red] bad layer" in output, output
+
+    def test_resolve_renders_composition_strategy_labels(self, temp_dir, project_dir):
+        """The composition chain's ``[<strategy>]`` label must not be eaten as a tag."""
+        self._install(temp_dir, project_dir, strategy="replace",
+                      pack_id="base-pack", priority=20)
+        self._install(temp_dir, project_dir, strategy="append",
+                      pack_id="app-pack", priority=5)
+
+        result = self._invoke(project_dir, ["preset", "resolve", "spec-template"])
+        assert result.exit_code == 0, (result.output, result.exception)
+        output = strip_ansi(result.output)
+        assert "Composition chain" in output, output
+        assert "[base]" in output, output
+        assert "[append]" in output, output
+
+
+class TestConstitutionSyncPreset:
+    """The bundled opt-in ``constitution-sync`` preset re-adds propagation.
+
+    Follow-up to #3790: core ``/constitution`` no longer propagates guidance
+    into templates. This preset restores that behavior for teams that treat
+    materialized templates as reviewed artifacts, delivered as a ``wrap`` of
+    the core command so it stays forward-compatible with core changes.
+    """
+
+    PRESET_DIR = Path(__file__).parent.parent / "presets" / "constitution-sync"
+
+    def test_manifest_provides_wrap_of_constitution(self):
+        manifest = yaml.safe_load((self.PRESET_DIR / "preset.yml").read_text())
+        assert manifest["preset"]["id"] == "constitution-sync"
+        entries = manifest["provides"]["templates"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["type"] == "command"
+        assert entry["name"] == "speckit.constitution"
+        assert entry["strategy"] == "wrap"
+        # Must target the post-#3790 baseline so propagation is not double-applied.
+        assert manifest["requires"]["speckit_version"] == ">=0.14.4"
+
+    def test_wrapper_uses_core_template_and_propagates(self):
+        text = (self.PRESET_DIR / "commands" / "speckit.constitution.md").read_text()
+
+        # Parse the Markdown frontmatter as YAML rather than substring-matching,
+        # so `strategy: wrap` is asserted structurally (not as text that could
+        # appear in the body) and {CORE_TEMPLATE} is asserted in the body only.
+        assert text.startswith("---\n")
+        _, frontmatter_block, body = text.split("---", 2)
+        frontmatter = yaml.safe_load(frontmatter_block)
+        assert frontmatter["strategy"] == "wrap"
+
+        assert "{CORE_TEMPLATE}" in body
+        assert "strategy: wrap" not in body  # only in frontmatter
+        # The three governed scaffolds the old checklist propagated into.
+        assert "plan-template.md" in body
+        assert "spec-template.md" in body
+        assert "tasks-template.md" in body
+        # Must not mutate versioned preset/extension artifacts.
+        assert "Do not edit versioned preset- or extension-provided template or command files" in body
+
+    def test_catalog_lists_bundled_preset(self):
+        manifest = yaml.safe_load((self.PRESET_DIR / "preset.yml").read_text())
+        catalog = json.loads((self.PRESET_DIR.parent / "catalog.json").read_text())
+        entry = catalog["presets"]["constitution-sync"]
+        assert entry["bundled"] is True
+        assert entry["version"] == manifest["preset"]["version"]
+        assert entry["provides"]["commands"] == 1
+        assert entry["provides"]["templates"] == 0
+
+    def test_wrap_composes_over_core_constitution(self, project_dir):
+        """Installing the preset yields a wrap layer atop the bundled core."""
+        manager = PresetManager(project_dir)
+        manager.install_from_directory(self.PRESET_DIR, "0.15.0")
+
+        resolver = PresetResolver(project_dir)
+        layers = resolver.collect_all_layers("speckit.constitution", "command")
+        assert len(layers) >= 2, "expected preset wrap layer plus a core base"
+        assert layers[0]["strategy"] == "wrap"
+        assert any("constitution-sync" in str(layer["path"]) for layer in layers)
+        assert layers[-1]["source"] == "core (bundled)"
+
+    def test_resolved_content_embeds_core_and_sync_pass(self, project_dir):
+        """resolve_content substitutes {CORE_TEMPLATE} so the effective command
+        contains both the bundled core body and the propagation pass."""
+        manager = PresetManager(project_dir)
+        manager.install_from_directory(self.PRESET_DIR, "0.15.0")
+
+        resolver = PresetResolver(project_dir)
+        content = resolver.resolve_content("speckit.constitution", "command")
+        assert content is not None
+        # {CORE_TEMPLATE} must be replaced, not left literal.
+        assert "{CORE_TEMPLATE}" not in content
+        # Core body is present (distinctive core-only heading).
+        assert "## Scope Guard" in content
+        # The wrapper's propagation pass is present and supersedes the guard.
+        assert "## Constitution Template Sync" in content
+        assert "supersedes the \"Scope Guard\" above" in content
+        assert "plan-template.md" in content

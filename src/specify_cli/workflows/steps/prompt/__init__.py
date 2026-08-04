@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import shutil
 from pathlib import Path
 from typing import Any
@@ -88,6 +89,15 @@ class PromptStep(StepBase):
                 ),
             )
 
+        # An invalid timeout reaches subprocess.run() and raises a raw
+        # TypeError ("unsupported operand type(s) for +: 'float' and 'str'")
+        # or ValueError, which the engine re-raises — taking down the whole
+        # run with a message that names neither the step nor 'timeout'. Fail
+        # this step cleanly instead, mirroring the shell step.
+        timeout_error = self._timeout_error(config)
+        if timeout_error is not None:
+            return StepResult(status=StepStatus.FAILED, error=timeout_error)
+
         # Attempt CLI dispatch
         timeout = config.get("timeout", 300)
         dispatch_result = self._try_dispatch(
@@ -132,6 +142,41 @@ class PromptStep(StepBase):
             )
 
     @staticmethod
+    def _timeout_error(config: dict[str, Any]) -> str | None:
+        """Return an error message if ``config['timeout']`` is invalid, else None.
+
+        Shared by execute() and validate() so both paths reject the same
+        values with the same message, mirroring the shell step. An absent
+        ``timeout`` is valid (the default is used). bool is a subclass of int,
+        but ``timeout: true`` is a config error rather than a duration, so it
+        is rejected explicitly. Non-finite floats (YAML ``.inf``/``.nan``) pass
+        a plain ``> 0`` check but would raise in subprocess.run(), and a
+        non-positive timeout makes subprocess.run() report an immediate
+        TimeoutExpired, so both are rejected too.
+        """
+        if "timeout" not in config:
+            return None
+        timeout = config["timeout"]
+        try:
+            valid_timeout = (
+                not isinstance(timeout, bool)
+                and isinstance(timeout, (int, float))
+                and timeout > 0
+                and math.isfinite(timeout)
+            )
+        except OverflowError:
+            # An int too large to convert to float (e.g. a 400-digit YAML
+            # scalar) clears every clause above and raises here — and would
+            # raise the same from subprocess.run(timeout=...).
+            valid_timeout = False
+        if not valid_timeout:
+            return (
+                f"Prompt step {config.get('id', '?')!r}: 'timeout' must be a "
+                f"positive number of seconds, got {timeout!r}."
+            )
+        return None
+
+    @staticmethod
     def _try_dispatch(
         prompt: str,
         integration_key: str | None,
@@ -168,6 +213,17 @@ class PromptStep(StepBase):
         # Prompt dispatch executes exec_args directly; require a non-empty argv.
         if not exec_args:
             return None
+
+        # Windows: ``subprocess.run`` calls ``CreateProcess``, which does not
+        # consult ``PATHEXT``, so a bare command name like ``claude`` installed
+        # as ``claude.cmd`` (the usual npm shim layout) fails with
+        # ``WinError 2``. That OSError is swallowed below and reported as "CLI
+        # not found or not installed" -- even though the preflight above just
+        # found it. Reuse the already-resolved path so the shim is executed,
+        # mirroring ``IntegrationBase.dispatch_command``, which the ``command``
+        # step already goes through. On POSIX this is the same executable.
+        if fallback_cli_path:
+            exec_args = [fallback_cli_path, *exec_args[1:]]
 
         import subprocess
 
@@ -239,4 +295,7 @@ class PromptStep(StepBase):
                 f"Prompt step {config.get('id', '?')!r}: 'model' must be a "
                 f"string, got {type(model).__name__}."
             )
+        timeout_error = self._timeout_error(config)
+        if timeout_error is not None:
+            errors.append(timeout_error)
         return errors
