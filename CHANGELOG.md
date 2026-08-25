@@ -2,6 +2,81 @@
 
 <!-- insert new changelog below this comment -->
 
+## [1.0.1] - 2026-08-21
+
+### Changed
+
+- docs: flatten project history navigation (#4265)
+- docs: use Spec Kit branding on documentation site (#4264)
+- docs: add existing project adoption guide (#4263)
+- docs: add project history page (#4262)
+- docs: mark Spec Kit's first anniversary (#4260)
+- docs: add workflow quickstarts (#4258)
+- chore(deps): bump astral-sh/setup-uv from 9.0.0 to 10.0.1 (#4244)
+- Update SpecAssay Check extension to v0.4.12 (#4254)
+- fix(workflows): require a 'cases' block on switch steps (#4144)
+- fix(workflows): strip the resolved value before matching switch cases (#4143)
+- fix(bundler): reject non-string manifest list members (#4091)
+- fix(presets): reject non-mapping catalog mutations (#4094)
+- fix(workflows): stop offering a condition correction that inverts it (#4230)
+- fix: use chunked read for integration and preset manifest hash (#3843)
+- docs: update landing page stats for 1.0.0 (#4251)
+- Add Azure Cosmos DB extension to community catalog (#4247)
+- chore(deps): bump actions/checkout from 6.0.3 to 7.0.1 (#4243)
+- chore(deps): bump actions/setup-node from 6.4.0 to 7.0.0 (#4242)
+- chore(deps): bump the codeql-action group with 2 updates (#4241)
+- chore: release 1.0.0, begin 1.0.1.dev0 development (#4246)
+
+## [1.0.0] - 2026-08-21
+
+### Changed
+
+- [extension] Update Security Review extension to v2.0.0 (#4223)
+- fix(presets): reject duplicate provides.templates name+type entries (#4191)
+- fix(bundler): decode a downloaded (non-zip) bundle manifest as UTF-8 (#4190)
+- Update Intake Sequencing Governance preset to v0.2.3 (#4235)
+- Update MAQA — Multi-Agent & Quality Assurance extension to v0.1.6 (#4234)
+- [bug-fix] Fix qodercli-skills-migration: migrate QodercliIntegration to SkillsIntegration (#4205)
+- [preset] Add Inventory Alignment preset to community catalog (#4229)
+- [extension] Add Spec Inventory extension to community catalog (#4228)
+- [extension] Update Architecture Guard extension to v2.3.6 (#4224)
+- Update SpecKit Companion extension to v0.20.2 (#4225)
+- fix(workflows): reject a condition that has no {{ }} block (#4182)
+- fix: raise feature assessment credit budget (#4222)
+- [extension] Add AgentDocx extension to community catalog (#4184)
+- fix(integrations): report a falsy non-mapping integration descriptor as a shape error (#4187)
+- Update Autonomous Run Governance preset to v0.4.1 (#4203)
+- fix(workflows): validate dispatch defaults (#4181)
+- Update Atlas extension display name in community catalog (#4202)
+- Add Closed Vocabulary Check preset to community catalog (#4201)
+- fix(utils): narrow bare except Exception in merge_json_files (#4189)
+- chore: release 0.16.5, begin 0.16.6.dev0 development (#4206)
+
+## [0.16.5] - 2026-08-19
+
+### Changed
+
+- fix(powershell): stop Out-Null swallowing setup-tasks AVAILABLE_DOCS lines (#4188)
+- fix: provision Spec Kit CLI and assess extension in feature-assess host setup steps (#4195)
+- fix: provision uv and Python for feature-assess workflow (#4193)
+- feat: add feature-assess agentic workflow that installs and runs Spec Kit (#4186)
+- [extension] Update Superpowers Implementation Bridge to v1.2.0 (#4183)
+- fix(init): stop specify init hanging on arrow-key pickers in agent harnesses (#4178)
+- [extension] Add DUBSAR Memory extension to community catalog (#4170)
+- Add AgentPay x402 extension to community catalog (#4174)
+- Update Keel Discovery extension to v0.2.0 (#4172)
+- fix: confine event hook script paths to the project tree (#4133)
+- Clarify extension catalog trust model in docs, help, and messaging (#4177)
+- Add pay-x402 community extension with correct catalog-addition timestamps (#4175)
+- Add ASCII Diagram Renderer extension to community catalog (#4173)
+- Update Intake Review Governance preset to v0.2.1 (#4169)
+- test(presets): normalize whitespace in resolve output assertion to prevent terminal line-wrap failures (#4166)
+- fix(workflows): clean up download temp file on interrupt or typer.Exit (#4134)
+- fix(workflows): report a falsy non-mapping overlay manifest as a shape error (#3884)
+- fix(bundler): resolve built-in step types when checking bundle component references (#3885)
+- Add SpecAssay bundle to community catalog (#4125)
+- chore: release 0.16.4, begin 0.16.5.dev0 development (#4124)
+
 ## [0.16.4] - 2026-08-14
 
 ### Changed

@@ -484,7 +484,10 @@ provides:
         manifest = PresetManifest(pack_dir / "preset.yml")
         hash_val = manifest.get_hash()
         assert hash_val.startswith("sha256:")
-        assert len(hash_val) > 10
+        import hashlib
+        content = (pack_dir / "preset.yml").read_bytes()
+        expected = f"sha256:{hashlib.sha256(content).hexdigest()}"
+        assert hash_val == expected
 
     def test_multiple_templates(self, temp_dir, valid_pack_data):
         """Test pack with multiple templates of different types."""
@@ -499,6 +502,41 @@ provides:
             yaml.dump(valid_pack_data, f)
         manifest = PresetManifest(manifest_path)
         assert len(manifest.templates) == 4
+
+    def test_duplicate_template_name_and_type_raises_validation_error(
+        self, temp_dir, valid_pack_data
+    ):
+        """A later entry with the same (name, type) pair must be rejected.
+
+        ``PresetResolver._manifest_declared_template`` returns the FIRST
+        'provides.templates' entry matching a given (name, type) pair, so a
+        later duplicate would be silently unreachable while still being
+        counted by ``PresetManifest.templates`` -- mirroring the sibling bug
+        fixed for ``ExtensionManifest``'s provides.templates/scripts (#4016).
+        """
+        valid_pack_data["provides"]["templates"] = [
+            {"type": "command", "name": "specify", "file": "commands/specify-v1.md"},
+            {"type": "command", "name": "specify", "file": "commands/specify-v2.md"},
+        ]
+        manifest_path = temp_dir / "preset.yml"
+        with open(manifest_path, 'w') as f:
+            yaml.dump(valid_pack_data, f)
+        with pytest.raises(PresetValidationError, match="Duplicate template name"):
+            PresetManifest(manifest_path)
+
+    def test_same_name_different_type_templates_allowed(
+        self, temp_dir, valid_pack_data
+    ):
+        """The same name may recur across different template types."""
+        valid_pack_data["provides"]["templates"] = [
+            {"type": "template", "name": "specify", "file": "templates/specify.md"},
+            {"type": "command", "name": "specify", "file": "commands/specify.md"},
+        ]
+        manifest_path = temp_dir / "preset.yml"
+        with open(manifest_path, 'w') as f:
+            yaml.dump(valid_pack_data, f)
+        manifest = PresetManifest(manifest_path)
+        assert len(manifest.templates) == 2
 
 
 # ===== PresetRegistry Tests =====
@@ -3273,6 +3311,38 @@ class TestPresetCatalogMultiCatalog:
             )
         assert result.exit_code == 1
         assert "[/red]absent" in result.output
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            [
+                "preset",
+                "catalog",
+                "add",
+                "https://example.com/catalog.json",
+                "--name",
+                "example",
+            ],
+            ["preset", "catalog", "remove", "example"],
+        ],
+    )
+    def test_catalog_mutation_rejects_non_mapping_config_root(
+        self, project_dir, args
+    ):
+        from typer.testing import CliRunner
+        from unittest.mock import patch
+        from specify_cli import app
+
+        config_path = project_dir / ".specify" / "preset-catalogs.yml"
+        original = "[]\n"
+        config_path.write_text(original, encoding="utf-8")
+
+        with patch.object(Path, "cwd", return_value=project_dir):
+            result = CliRunner().invoke(app, args)
+
+        assert result.exit_code == 1
+        assert "expected a mapping" in result.output
+        assert config_path.read_text(encoding="utf-8") == original
 
     def test_env_var_overrides_catalogs(self, project_dir, monkeypatch):
         """Test that SPECKIT_PRESET_CATALOG_URL env var overrides defaults."""
